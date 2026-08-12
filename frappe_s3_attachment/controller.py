@@ -284,15 +284,23 @@ def upload_existing_files_s3(name):
                 key
             )
 
-        # Remove file from local.
-        os.remove(file_path)
-
+        # Update DB first so a crash during removal doesn't leave an orphaned record.
         frappe.db.sql(
             """UPDATE `tabFile` SET file_url=%s, folder=%s,
             old_parent=%s, content_hash=%s WHERE name=%s""",
             (file_url, "Home/Attachments", "Home/Attachments", key, doc.name),
         )
         frappe.db.commit()
+
+        # Remove local file after DB is committed.
+        # Use try/except in case the file was already removed by a previous
+        # failed run or a concurrent worker.
+        try:
+            os.remove(file_path)
+        except FileNotFoundError:
+            frappe.logger().warning(
+                f"Local file already removed, skipping delete: {file_path}"
+            )
 
 
 def s3_file_regex_match(file_url):
