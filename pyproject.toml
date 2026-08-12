@@ -1,5 +1,5 @@
 [project]
-name = "frappe-attachments-s3"
+name = "frappe-s3-attachment"
 version = "1.0.0"
 description = "A frappe app to upload file attachments in doctypes to s3."
 readme = "README.md"
