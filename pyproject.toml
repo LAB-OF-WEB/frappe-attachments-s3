@@ -10,8 +10,6 @@ authors = [
 license = {text = "MIT"}
 
 dependencies = [
-    "frappe>=10.0.0,<17.0.0",
-    "pypika @ git+https://github.com/frappe/pypika@2c50e6142b2d61d2d243e466fdd5dc03b3d918f2",
     "python-magic==0.4.18",
     "boto3>=1.34.0",
     "botocore>=1.34.0",
