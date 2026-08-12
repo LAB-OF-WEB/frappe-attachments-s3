@@ -87,6 +87,10 @@ class S3Operations(object):
 
         doc_path = None
 
+        # Guard against None values to avoid TypeError during concatenation
+        parent_doctype = parent_doctype or "unknown"
+        parent_name = parent_name or "unknown"
+
         if not doc_path:
             if self.folder_name:
                 final_key = self.folder_name + "/" + year + "/" + month + \
@@ -309,11 +313,22 @@ def migrate_existing_files():
 
     files_list = frappe.get_all(
         'File',
-        fields=['name', 'file_url']
+        fields=['name', 'file_url', 'is_private']
     )
+    site_path = frappe.utils.get_site_path()
     for file in files_list:
         if file['file_url']:
             if not s3_file_regex_match(file['file_url']):
+                # Skip files that don't physically exist on the server
+                if file['is_private']:
+                    file_path = site_path + file['file_url']
+                else:
+                    file_path = site_path + '/public' + file['file_url']
+                if not os.path.exists(file_path):
+                    frappe.logger().warning(
+                        f"Skipping missing file: {file['name']} ({file['file_url']})"
+                    )
+                    continue
                 upload_existing_files_s3(file['name'])
     return True
 
