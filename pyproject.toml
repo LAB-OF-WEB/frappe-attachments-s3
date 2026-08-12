@@ -22,5 +22,8 @@ dependencies = [
 requires = ["setuptools>=45", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.frappe]
+app_name = "frappe_s3_attachment"
+
 [tool.bench.frappe-dependencies]
 frappe = ">=10.0.0,<17.0.0"
