@@ -9,7 +9,7 @@ import string
 import boto3
 
 from botocore.client import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 import frappe
 
@@ -104,6 +104,25 @@ class S3Operations(object):
             final_key = doc_path + '/' + key + "_" + file_name
             return final_key
 
+    def verify_s3_object_exists(self, key):
+        """
+        Verify that the object actually exists in S3 (head_object check).
+        """
+        try:
+            self.S3_CLIENT.head_object(Bucket=self.BUCKET, Key=key)
+            return True
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code')
+            frappe.logger().error(
+                "S3 head_object verification failed for key {0}: {1}".format(key, error_code)
+            )
+            return False
+        except Exception as e:
+            frappe.logger().error(
+                "S3 head_object verification error for key {0}: {1}".format(key, str(e))
+            )
+            return False
+
     def upload_files_to_s3_with_key(
             self, file_path, file_name, is_private, parent_doctype, parent_name
     ):
@@ -115,31 +134,30 @@ class S3Operations(object):
         key = self.key_generator(file_name, parent_doctype, parent_name)
         content_type = mime_type
         try:
-            if is_private:
-                self.S3_CLIENT.upload_file(
-                    file_path, self.BUCKET, key,
-                    ExtraArgs={
-                        "ContentType": content_type,
-                        "Metadata": {
-                            "ContentType": content_type,
-                            "file_name": file_name
-                        }
-                    }
-                )
-            else:
-                self.S3_CLIENT.upload_file(
-                    file_path, self.BUCKET, key,
-                    ExtraArgs={
-                        "ContentType": content_type,
-                        "ACL": 'public-read',
-                        "Metadata": {
-                            "ContentType": content_type,
+            extra_args = {
+                "ContentType": content_type,
+                "Metadata": {
+                    "ContentType": content_type,
+                    "file_name": file_name
+                }
+            }
+            if not is_private:
+                extra_args["ACL"] = 'public-read'
 
-                        }
-                    }
-                )
+            self.S3_CLIENT.upload_file(
+                file_path, self.BUCKET, key,
+                ExtraArgs=extra_args
+            )
 
-        except boto3.exceptions.S3UploadFailedError:
+        except (ClientError, BotoCoreError) as e:
+            frappe.logger().error(
+                "S3 Upload failed for file {0} with error: {1}".format(file_name, str(e))
+            )
+            frappe.throw(frappe._("File Upload to S3 Failed: {0}").format(str(e)))
+        except Exception as e:
+            frappe.logger().error(
+                "Unexpected error uploading file {0} to S3: {1}".format(file_name, str(e))
+            )
             frappe.throw(frappe._("File Upload Failed. Please try again."))
         return key
 
@@ -191,7 +209,7 @@ class S3Operations(object):
 @frappe.whitelist()
 def file_upload_to_s3(doc, method):
     """
-    check and upload files to s3. the path check and
+    check and upload files to s3 with resilient atomic ordering.
     """
     s3_upload = S3Operations()
     path = doc.file_url
@@ -204,11 +222,22 @@ def file_upload_to_s3(doc, method):
             file_path = site_path + '/public' + path
         else:
             file_path = site_path + path
+
+        if not os.path.exists(file_path):
+            frappe.logger().warning(
+                "Local file not found on disk, skipping S3 upload: {0}".format(file_path)
+            )
+            return
+
         key = s3_upload.upload_files_to_s3_with_key(
             file_path, doc.file_name,
             doc.is_private, parent_doctype,
             parent_name
         )
+
+        # Verify file is confirmed on S3 before committing DB or deleting local copy
+        if not s3_upload.verify_s3_object_exists(key):
+            frappe.throw(frappe._("S3 upload could not be verified on AWS. Local file preserved."))
 
         if doc.is_private:
             method = "frappe_s3_attachment.controller.generate_file"
@@ -219,7 +248,8 @@ def file_upload_to_s3(doc, method):
                 s3_upload.BUCKET,
                 key
             )
-        os.remove(file_path)
+
+        # 1. Update Database FIRST and commit
         frappe.db.sql("""UPDATE `tabFile` SET file_url=%s, folder=%s,
             old_parent=%s, content_hash=%s WHERE name=%s""", (
             file_url, 'Home/Attachments', 'Home/Attachments', key, doc.name))
@@ -230,6 +260,14 @@ def file_upload_to_s3(doc, method):
             frappe.db.set_value(parent_doctype, parent_name, frappe.get_meta(parent_doctype).get('image_field'), file_url)
 
         frappe.db.commit()
+
+        # 2. Remove local file ONLY after DB commit succeeds
+        try:
+            os.remove(file_path)
+        except (OSError, FileNotFoundError) as e:
+            frappe.logger().warning(
+                "Could not remove local file {0} after S3 upload: {1}".format(file_path, str(e))
+            )
 
 
 @frappe.whitelist()
@@ -249,7 +287,7 @@ def generate_file(key=None, file_name=None):
 
 def upload_existing_files_s3(name):
     """
-    Function to upload all existing files.
+    Function to upload all existing files with atomic resilience and head verification.
     """
     file_doc_name = frappe.db.get_value('File', {'name': name})
     if file_doc_name:
@@ -274,9 +312,16 @@ def upload_existing_files_s3(name):
             parent_name
         )
 
+        # Verify object was written to S3 before database update and local file deletion
+        if not s3_upload.verify_s3_object_exists(key):
+            frappe.logger().error(
+                "S3 verification failed for existing file {0} (key: {1}). Skipping local deletion.".format(doc.name, key)
+            )
+            return
+
         if doc.is_private:
             method = "frappe_s3_attachment.controller.generate_file"
-            file_url = """/api/method/{0}?key={1}""".format(method, key)
+            file_url = """/api/method/{0}?key={1}&file_name={2}""".format(method, key, doc.file_name)
         else:
             file_url = '{}/{}/{}'.format(
                 s3_upload.S3_CLIENT.meta.endpoint_url,
@@ -293,13 +338,11 @@ def upload_existing_files_s3(name):
         frappe.db.commit()
 
         # Remove local file after DB is committed.
-        # Use try/except in case the file was already removed by a previous
-        # failed run or a concurrent worker.
         try:
             os.remove(file_path)
-        except FileNotFoundError:
+        except (OSError, FileNotFoundError):
             frappe.logger().warning(
-                f"Local file already removed, skipping delete: {file_path}"
+                "Local file already removed or inaccessible, skipping delete: {0}".format(file_path)
             )
 
 
@@ -316,16 +359,36 @@ def s3_file_regex_match(file_url):
 @frappe.whitelist()
 def migrate_existing_files():
     """
-    Function to migrate the existing files to s3.
+    Function to enqueue migration of existing files to s3 in background.
     """
+    frappe.enqueue(
+        "frappe_s3_attachment.controller.process_files_migration",
+        queue="long",
+        timeout=3600,
+        is_async=True,
+        user=frappe.session.user
+    )
+    return {
+        "status": "enqueued",
+        "message": frappe._("File migration started in background.")
+    }
 
+
+def process_files_migration(user=None):
+    """
+    Background worker to migrate existing files to s3.
+    """
     files_list = frappe.get_all(
         'File',
         fields=['name', 'file_url', 'is_private']
     )
     site_path = frappe.utils.get_site_path()
+    migrated_count = 0
+    skipped_count = 0
+    failed_count = 0
+
     for file in files_list:
-        if file['file_url']:
+        if file.get('file_url'):
             if not s3_file_regex_match(file['file_url']):
                 # Skip files that don't physically exist on the server
                 if file['is_private']:
@@ -334,11 +397,29 @@ def migrate_existing_files():
                     file_path = site_path + '/public' + file['file_url']
                 if not os.path.exists(file_path):
                     frappe.logger().warning(
-                        f"Skipping missing file: {file['name']} ({file['file_url']})"
+                        "Skipping missing file: {0} ({1})".format(file['name'], file['file_url'])
                     )
+                    skipped_count += 1
                     continue
-                upload_existing_files_s3(file['name'])
-    return True
+                try:
+                    upload_existing_files_s3(file['name'])
+                    migrated_count += 1
+                except Exception as e:
+                    failed_count += 1
+                    frappe.logger().error(
+                        "Failed to migrate file {0}: {1}".format(file['name'], str(e))
+                    )
+
+    summary_msg = frappe._("S3 Migration completed: {0} migrated, {1} skipped, {2} failed.").format(
+        migrated_count, skipped_count, failed_count
+    )
+    frappe.logger().info(summary_msg)
+
+    frappe.publish_realtime(
+        "s3_migration_complete",
+        {"message": summary_msg},
+        user=user
+    )
 
 
 def delete_from_cloud(doc, method):
