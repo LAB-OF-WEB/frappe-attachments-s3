@@ -209,7 +209,7 @@ class S3Operations(object):
 def update_all_matching_file_records(original_path, is_private, key, s3_upload):
     """
     Find and update all tabFile records matching the exact original file_url and is_private status,
-    including updating attached doctypes with image_fields.
+    including updating attached doctypes with image_fields and logging to S3 File.
     """
     matching_files = frappe.get_all(
         'File',
@@ -217,15 +217,21 @@ def update_all_matching_file_records(original_path, is_private, key, s3_upload):
             'file_url': original_path,
             'is_private': 1 if is_private else 0
         },
-        fields=['name', 'file_name', 'attached_to_doctype', 'attached_to_name', 'is_private']
+        fields=['name', 'file_name', 'attached_to_doctype', 'attached_to_name', 'is_private', 'content_hash']
     )
 
     updated_names = []
+    links_data = []
+    primary_s3_url = ""
+    original_hash = None
+
     for file_info in matching_files:
         name = file_info['name']
         f_name = file_info.get('file_name') or os.path.basename(original_path)
         attached_doctype = file_info.get('attached_to_doctype')
         attached_name = file_info.get('attached_to_name')
+        if file_info.get('content_hash') and not original_hash:
+            original_hash = file_info.get('content_hash')
 
         if is_private:
             method = "frappe_s3_attachment.controller.generate_file"
@@ -236,6 +242,8 @@ def update_all_matching_file_records(original_path, is_private, key, s3_upload):
                 s3_upload.BUCKET,
                 key
             )
+        if not primary_s3_url:
+            primary_s3_url = file_url
 
         frappe.db.sql(
             """UPDATE `tabFile` SET file_url=%s, folder=%s,
@@ -243,18 +251,48 @@ def update_all_matching_file_records(original_path, is_private, key, s3_upload):
             (file_url, 'Home/Attachments', 'Home/Attachments', key, name)
         )
 
+        image_field_name = None
         if attached_doctype and attached_name:
             try:
                 meta = frappe.get_meta(attached_doctype)
                 if meta and meta.get('image_field'):
-                    image_field = meta.get('image_field')
-                    frappe.db.set_value(attached_doctype, attached_name, image_field, file_url)
+                    image_field_name = meta.get('image_field')
+                    frappe.db.set_value(attached_doctype, attached_name, image_field_name, file_url)
             except Exception as e:
                 frappe.logger().warning(
                     "Could not update image_field for {0} {1}: {2}".format(attached_doctype, attached_name, str(e))
                 )
 
+        links_data.append({
+            "file_doc": name,
+            "attached_to_doctype": attached_doctype,
+            "attached_to_name": attached_name,
+            "image_field": image_field_name,
+            "original_value": original_path,
+            "s3_value": file_url,
+            "restored": 0
+        })
         updated_names.append(name)
+
+    # Create S3 File tracking entry for full visibility and restoration capability
+    try:
+        s3_file_doc = frappe.new_doc('S3 File')
+        s3_file_doc.file_name = os.path.basename(original_path)
+        s3_file_doc.s3_key = key
+        s3_file_doc.bucket_name = s3_upload.BUCKET
+        s3_file_doc.original_file_url = original_path
+        s3_file_doc.s3_url = primary_s3_url
+        s3_file_doc.content_hash = original_hash or ""
+        s3_file_doc.is_private = 1 if is_private else 0
+        s3_file_doc.status = "Active"
+        s3_file_doc.migrated_at = frappe.utils.now_datetime()
+        for item in links_data:
+            s3_file_doc.append("links", item)
+        s3_file_doc.insert(ignore_permissions=True)
+    except Exception as e:
+        frappe.logger().warning(
+            "Could not create S3 File tracking record for key {0}: {1}".format(key, str(e))
+        )
 
     frappe.db.commit()
     return updated_names
