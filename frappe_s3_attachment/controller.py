@@ -476,8 +476,21 @@ def migrate_existing_files():
 
 def process_files_migration(user=None):
     """
-    Background worker to migrate existing files to s3.
+    Background worker to migrate existing files to s3 with S3 Migration audit logging.
     """
+    start_time = datetime.datetime.now()
+    migration_doc = None
+    try:
+        migration_doc = frappe.new_doc("S3 Migration")
+        migration_doc.operation_type = "Migrate to S3"
+        migration_doc.status = "In Progress"
+        migration_doc.started_at = frappe.utils.now_datetime()
+        migration_doc.initiated_by = user or frappe.session.user
+        migration_doc.insert(ignore_permissions=True)
+        frappe.db.commit()
+    except Exception as e:
+        frappe.logger().warning("Could not initialize S3 Migration log: {0}".format(str(e)))
+
     files_list = frappe.get_all(
         'File',
         fields=['name', 'file_url', 'is_private']
@@ -487,6 +500,7 @@ def process_files_migration(user=None):
     skipped_count = 0
     failed_count = 0
     processed_names = set()
+    total_files_scanned = len(files_list)
 
     for file in files_list:
         file_name = file['name']
@@ -497,6 +511,14 @@ def process_files_migration(user=None):
         if not file_url:
             skipped_count += 1
             processed_names.add(file_name)
+            if migration_doc:
+                migration_doc.append("warnings_and_errors", {
+                    "file_doc": file_name,
+                    "file_name": file_name,
+                    "file_url": "",
+                    "log_type": "Skipped",
+                    "reason": "Empty file_url in tabFile"
+                })
             continue
 
         if s3_file_regex_match(file_url):
@@ -515,6 +537,14 @@ def process_files_migration(user=None):
             )
             skipped_count += 1
             processed_names.add(file_name)
+            if migration_doc:
+                migration_doc.append("warnings_and_errors", {
+                    "file_doc": file_name,
+                    "file_name": os.path.basename(file_url),
+                    "file_url": file_url,
+                    "log_type": "Skipped",
+                    "reason": "Physical file not found on local disk: {0}".format(file_path)
+                })
             continue
 
         try:
@@ -525,21 +555,63 @@ def process_files_migration(user=None):
             else:
                 skipped_count += 1
                 processed_names.add(file_name)
+                if migration_doc:
+                    migration_doc.append("warnings_and_errors", {
+                        "file_doc": file_name,
+                        "file_name": os.path.basename(file_url),
+                        "file_url": file_url,
+                        "log_type": "Skipped",
+                        "reason": "upload_existing_files_s3 returned empty"
+                    })
         except Exception as e:
             failed_count += 1
             processed_names.add(file_name)
+            error_msg = str(e)
             frappe.logger().error(
-                "Failed to migrate file {0}: {1}".format(file_name, str(e))
+                "Failed to migrate file {0}: {1}".format(file_name, error_msg)
             )
+            if migration_doc:
+                migration_doc.append("warnings_and_errors", {
+                    "file_doc": file_name,
+                    "file_name": os.path.basename(file_url),
+                    "file_url": file_url,
+                    "log_type": "Error",
+                    "reason": error_msg
+                })
 
+    end_time = datetime.datetime.now()
+    duration_secs = (end_time - start_time).total_seconds()
     summary_msg = frappe._("S3 Migration completed: {0} migrated, {1} skipped, {2} failed.").format(
         migrated_count, skipped_count, failed_count
     )
     frappe.logger().info(summary_msg)
 
+    if migration_doc:
+        try:
+            migration_doc.completed_at = frappe.utils.now_datetime()
+            migration_doc.duration_seconds = duration_secs
+            migration_doc.total_files_scanned = total_files_scanned
+            migration_doc.successful_files = migrated_count
+            migration_doc.skipped_files = skipped_count
+            migration_doc.failed_files = failed_count
+            migration_doc.log_summary = summary_msg
+            if failed_count == 0 and skipped_count == 0:
+                migration_doc.status = "Completed"
+            elif migrated_count == 0 and failed_count > 0:
+                migration_doc.status = "Failed"
+            else:
+                migration_doc.status = "Completed with Warnings"
+            migration_doc.save(ignore_permissions=True)
+            frappe.db.commit()
+        except Exception as e:
+            frappe.logger().warning("Could not finalize S3 Migration log: {0}".format(str(e)))
+
     frappe.publish_realtime(
         "s3_migration_complete",
-        {"message": summary_msg},
+        {
+            "message": summary_msg,
+            "migration_doc": migration_doc.name if migration_doc else None
+        },
         user=user
     )
 
@@ -570,23 +642,38 @@ def restore_all_s3_files():
 
 def process_restore_all_s3_files(user=None):
     """
-    Background worker to fetch all files from S3 back to local disk and revert database URLs.
+    Background worker to fetch all files from S3 back to local disk and revert database URLs with S3 Migration audit logging.
     Does NOT delete files from AWS S3.
     """
+    start_time = datetime.datetime.now()
+    migration_doc = None
+    try:
+        migration_doc = frappe.new_doc("S3 Migration")
+        migration_doc.operation_type = "Restore from S3"
+        migration_doc.status = "In Progress"
+        migration_doc.started_at = frappe.utils.now_datetime()
+        migration_doc.initiated_by = user or frappe.session.user
+        migration_doc.insert(ignore_permissions=True)
+        frappe.db.commit()
+    except Exception as e:
+        frappe.logger().warning("Could not initialize S3 Migration restore log: {0}".format(str(e)))
+
     site_path = frappe.utils.get_site_path()
     s3_ops = S3Operations()
     restored_count = 0
     skipped_count = 0
     failed_count = 0
     processed_keys = set()
+    total_files_scanned = 0
 
     # 1. First restore all documented S3 File entries
     try:
         s3_files = frappe.get_all(
             "S3 File",
             filters={"status": ["!=", "Restored"]},
-            fields=["name", "s3_key"]
+            fields=["name", "s3_key", "original_file_url", "file_name"]
         )
+        total_files_scanned += len(s3_files)
         for s3_f in s3_files:
             try:
                 s3_doc = frappe.get_doc("S3 File", s3_f["name"])
@@ -596,11 +683,28 @@ def process_restore_all_s3_files(user=None):
                     processed_keys.add(s3_doc.s3_key)
                 elif res.get("status") == "already_restored":
                     skipped_count += 1
+                    if migration_doc:
+                        migration_doc.append("warnings_and_errors", {
+                            "file_doc": s3_f["name"],
+                            "file_name": s3_f.get("file_name") or s3_doc.file_name,
+                            "file_url": s3_doc.original_file_url,
+                            "log_type": "Skipped",
+                            "reason": "File already marked as Restored"
+                        })
             except Exception as e:
                 failed_count += 1
+                error_msg = str(e)
                 frappe.logger().error(
-                    "Failed restoring S3 File {0}: {1}".format(s3_f["name"], str(e))
+                    "Failed restoring S3 File {0}: {1}".format(s3_f["name"], error_msg)
                 )
+                if migration_doc:
+                    migration_doc.append("warnings_and_errors", {
+                        "file_doc": s3_f["name"],
+                        "file_name": s3_f.get("file_name") or "",
+                        "file_url": s3_f.get("original_file_url") or "",
+                        "log_type": "Error",
+                        "reason": error_msg
+                    })
     except Exception as e:
         frappe.logger().warning(
             "Could not query S3 File doctype for restore: {0}".format(str(e))
@@ -617,6 +721,7 @@ def process_restore_all_s3_files(user=None):
             if not s3_file_regex_match(url):
                 continue
 
+            total_files_scanned += 1
             key = f.get("content_hash")
             if not key or "/" not in key:
                 if "/api/method/frappe_s3_attachment.controller.generate_file" in url:
@@ -630,6 +735,14 @@ def process_restore_all_s3_files(user=None):
 
             if not key:
                 skipped_count += 1
+                if migration_doc:
+                    migration_doc.append("warnings_and_errors", {
+                        "file_doc": f["name"],
+                        "file_name": f.get("file_name") or "",
+                        "file_url": url,
+                        "log_type": "Skipped",
+                        "reason": "Could not determine S3 key from File record"
+                    })
                 continue
 
             if key in processed_keys:
@@ -669,20 +782,54 @@ def process_restore_all_s3_files(user=None):
                 processed_keys.add(key)
             except Exception as e:
                 failed_count += 1
+                error_msg = str(e)
                 frappe.logger().error(
-                    "Failed restoring file {0} from S3: {1}".format(f["name"], str(e))
+                    "Failed restoring file {0} from S3: {1}".format(f["name"], error_msg)
                 )
+                if migration_doc:
+                    migration_doc.append("warnings_and_errors", {
+                        "file_doc": f["name"],
+                        "file_name": f.get("file_name") or "",
+                        "file_url": url,
+                        "log_type": "Error",
+                        "reason": error_msg
+                    })
     except Exception as e:
         frappe.logger().error("Error querying tabFile for legacy restore: {0}".format(str(e)))
 
+    end_time = datetime.datetime.now()
+    duration_secs = (end_time - start_time).total_seconds()
     summary_msg = frappe._("S3 Restore completed: {0} restored, {1} skipped, {2} failed.").format(
         restored_count, skipped_count, failed_count
     )
     frappe.logger().info(summary_msg)
 
+    if migration_doc:
+        try:
+            migration_doc.completed_at = frappe.utils.now_datetime()
+            migration_doc.duration_seconds = duration_secs
+            migration_doc.total_files_scanned = total_files_scanned
+            migration_doc.successful_files = restored_count
+            migration_doc.skipped_files = skipped_count
+            migration_doc.failed_files = failed_count
+            migration_doc.log_summary = summary_msg
+            if failed_count == 0 and skipped_count == 0:
+                migration_doc.status = "Completed"
+            elif restored_count == 0 and failed_count > 0:
+                migration_doc.status = "Failed"
+            else:
+                migration_doc.status = "Completed with Warnings"
+            migration_doc.save(ignore_permissions=True)
+            frappe.db.commit()
+        except Exception as e:
+            frappe.logger().warning("Could not finalize S3 Migration restore log: {0}".format(str(e)))
+
     frappe.publish_realtime(
         "s3_restore_complete",
-        {"message": summary_msg},
+        {
+            "message": summary_msg,
+            "migration_doc": migration_doc.name if migration_doc else None
+        },
         user=user
     )
 
