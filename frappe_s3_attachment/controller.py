@@ -206,13 +206,74 @@ class S3Operations(object):
         return url
 
 
+def update_all_matching_file_records(original_path, is_private, key, s3_upload):
+    """
+    Find and update all tabFile records matching the exact original file_url and is_private status,
+    including updating attached doctypes with image_fields.
+    """
+    matching_files = frappe.get_all(
+        'File',
+        filters={
+            'file_url': original_path,
+            'is_private': 1 if is_private else 0
+        },
+        fields=['name', 'file_name', 'attached_to_doctype', 'attached_to_name', 'is_private']
+    )
+
+    updated_names = []
+    for file_info in matching_files:
+        name = file_info['name']
+        f_name = file_info.get('file_name') or os.path.basename(original_path)
+        attached_doctype = file_info.get('attached_to_doctype')
+        attached_name = file_info.get('attached_to_name')
+
+        if is_private:
+            method = "frappe_s3_attachment.controller.generate_file"
+            file_url = """/api/method/{0}?key={1}&file_name={2}""".format(method, key, f_name)
+        else:
+            file_url = '{}/{}/{}'.format(
+                s3_upload.S3_CLIENT.meta.endpoint_url,
+                s3_upload.BUCKET,
+                key
+            )
+
+        frappe.db.sql(
+            """UPDATE `tabFile` SET file_url=%s, folder=%s,
+            old_parent=%s, content_hash=%s WHERE name=%s""",
+            (file_url, 'Home/Attachments', 'Home/Attachments', key, name)
+        )
+
+        if attached_doctype and attached_name:
+            try:
+                meta = frappe.get_meta(attached_doctype)
+                if meta and meta.get('image_field'):
+                    image_field = meta.get('image_field')
+                    frappe.db.set_value(attached_doctype, attached_name, image_field, file_url)
+            except Exception as e:
+                frappe.logger().warning(
+                    "Could not update image_field for {0} {1}: {2}".format(attached_doctype, attached_name, str(e))
+                )
+
+        updated_names.append(name)
+
+    frappe.db.commit()
+    return updated_names
+
+
 @frappe.whitelist()
 def file_upload_to_s3(doc, method):
     """
-    check and upload files to s3 with resilient atomic ordering.
+    check and upload files to s3 with resilient atomic ordering, updating all duplicate/shared references.
     """
     s3_upload = S3Operations()
     path = doc.file_url
+    if not path:
+        return
+
+    # If it's already an S3 URL, skip
+    if s3_file_regex_match(path):
+        return
+
     site_path = frappe.utils.get_site_path()
     parent_doctype = doc.attached_to_doctype or 'File'
     parent_name = doc.attached_to_name
@@ -239,27 +300,19 @@ def file_upload_to_s3(doc, method):
         if not s3_upload.verify_s3_object_exists(key):
             frappe.throw(frappe._("S3 upload could not be verified on AWS. Local file preserved."))
 
+        # 1. Update ALL tabFile records sharing this exact file_url and commit
+        update_all_matching_file_records(path, doc.is_private, key, s3_upload)
+
+        # Sync current in-memory doc
         if doc.is_private:
-            method = "frappe_s3_attachment.controller.generate_file"
-            file_url = """/api/method/{0}?key={1}&file_name={2}""".format(method, key, doc.file_name)
+            method_path = "frappe_s3_attachment.controller.generate_file"
+            doc.file_url = """/api/method/{0}?key={1}&file_name={2}""".format(method_path, key, doc.file_name)
         else:
-            file_url = '{}/{}/{}'.format(
+            doc.file_url = '{}/{}/{}'.format(
                 s3_upload.S3_CLIENT.meta.endpoint_url,
                 s3_upload.BUCKET,
                 key
             )
-
-        # 1. Update Database FIRST and commit
-        frappe.db.sql("""UPDATE `tabFile` SET file_url=%s, folder=%s,
-            old_parent=%s, content_hash=%s WHERE name=%s""", (
-            file_url, 'Home/Attachments', 'Home/Attachments', key, doc.name))
-
-        doc.file_url = file_url
-
-        if parent_doctype and frappe.get_meta(parent_doctype).get('image_field'):
-            frappe.db.set_value(parent_doctype, parent_name, frappe.get_meta(parent_doctype).get('image_field'), file_url)
-
-        frappe.db.commit()
 
         # 2. Remove local file ONLY after DB commit succeeds
         try:
@@ -287,63 +340,59 @@ def generate_file(key=None, file_name=None):
 
 def upload_existing_files_s3(name):
     """
-    Function to upload all existing files with atomic resilience and head verification.
+    Function to upload an existing file and update all File records sharing its file_url.
+    Returns list of updated File doc names.
     """
     file_doc_name = frappe.db.get_value('File', {'name': name})
-    if file_doc_name:
-        doc = frappe.get_doc('File', name)
-        s3_upload = S3Operations()
-        path = doc.file_url
-        site_path = frappe.utils.get_site_path()
-        parent_doctype = doc.attached_to_doctype
-        parent_name = doc.attached_to_name
-        if not doc.is_private:
-            file_path = site_path + '/public' + path
-        else:
-            file_path = site_path + path
+    if not file_doc_name:
+        return []
 
-        # File exists?
-        if not os.path.exists(file_path):
-            return
+    doc = frappe.get_doc('File', name)
+    path = doc.file_url
+    if not path or s3_file_regex_match(path):
+        return []
 
-        key = s3_upload.upload_files_to_s3_with_key(
-            file_path, doc.file_name,
-            doc.is_private, parent_doctype,
-            parent_name
+    s3_upload = S3Operations()
+    site_path = frappe.utils.get_site_path()
+    parent_doctype = doc.attached_to_doctype
+    parent_name = doc.attached_to_name
+    if not doc.is_private:
+        file_path = site_path + '/public' + path
+    else:
+        file_path = site_path + path
+
+    # File exists?
+    if not os.path.exists(file_path):
+        frappe.logger().warning(
+            "Local file not found on disk, skipping S3 upload: {0} ({1})".format(doc.name, file_path)
+        )
+        return []
+
+    key = s3_upload.upload_files_to_s3_with_key(
+        file_path, doc.file_name,
+        doc.is_private, parent_doctype,
+        parent_name
+    )
+
+    # Verify object was written to S3 before database update and local file deletion
+    if not s3_upload.verify_s3_object_exists(key):
+        frappe.logger().error(
+            "S3 verification failed for existing file {0} (key: {1}). Skipping local deletion.".format(doc.name, key)
+        )
+        return []
+
+    # Update all File records sharing this file_url and commit DB
+    updated_names = update_all_matching_file_records(path, doc.is_private, key, s3_upload)
+
+    # Remove local file after DB is committed.
+    try:
+        os.remove(file_path)
+    except (OSError, FileNotFoundError):
+        frappe.logger().warning(
+            "Local file already removed or inaccessible, skipping delete: {0}".format(file_path)
         )
 
-        # Verify object was written to S3 before database update and local file deletion
-        if not s3_upload.verify_s3_object_exists(key):
-            frappe.logger().error(
-                "S3 verification failed for existing file {0} (key: {1}). Skipping local deletion.".format(doc.name, key)
-            )
-            return
-
-        if doc.is_private:
-            method = "frappe_s3_attachment.controller.generate_file"
-            file_url = """/api/method/{0}?key={1}&file_name={2}""".format(method, key, doc.file_name)
-        else:
-            file_url = '{}/{}/{}'.format(
-                s3_upload.S3_CLIENT.meta.endpoint_url,
-                s3_upload.BUCKET,
-                key
-            )
-
-        # Update DB first so a crash during removal doesn't leave an orphaned record.
-        frappe.db.sql(
-            """UPDATE `tabFile` SET file_url=%s, folder=%s,
-            old_parent=%s, content_hash=%s WHERE name=%s""",
-            (file_url, "Home/Attachments", "Home/Attachments", key, doc.name),
-        )
-        frappe.db.commit()
-
-        # Remove local file after DB is committed.
-        try:
-            os.remove(file_path)
-        except (OSError, FileNotFoundError):
-            frappe.logger().warning(
-                "Local file already removed or inaccessible, skipping delete: {0}".format(file_path)
-            )
+    return updated_names
 
 
 def s3_file_regex_match(file_url):
@@ -386,29 +435,51 @@ def process_files_migration(user=None):
     migrated_count = 0
     skipped_count = 0
     failed_count = 0
+    processed_names = set()
 
     for file in files_list:
-        if file.get('file_url'):
-            if not s3_file_regex_match(file['file_url']):
-                # Skip files that don't physically exist on the server
-                if file['is_private']:
-                    file_path = site_path + file['file_url']
-                else:
-                    file_path = site_path + '/public' + file['file_url']
-                if not os.path.exists(file_path):
-                    frappe.logger().warning(
-                        "Skipping missing file: {0} ({1})".format(file['name'], file['file_url'])
-                    )
-                    skipped_count += 1
-                    continue
-                try:
-                    upload_existing_files_s3(file['name'])
-                    migrated_count += 1
-                except Exception as e:
-                    failed_count += 1
-                    frappe.logger().error(
-                        "Failed to migrate file {0}: {1}".format(file['name'], str(e))
-                    )
+        file_name = file['name']
+        if file_name in processed_names:
+            continue
+
+        file_url = file.get('file_url')
+        if not file_url:
+            skipped_count += 1
+            processed_names.add(file_name)
+            continue
+
+        if s3_file_regex_match(file_url):
+            processed_names.add(file_name)
+            continue
+
+        # Check if local file exists
+        if file.get('is_private'):
+            file_path = site_path + file_url
+        else:
+            file_path = site_path + '/public' + file_url
+
+        if not os.path.exists(file_path):
+            frappe.logger().warning(
+                "Skipping missing file on disk: {0} ({1})".format(file_name, file_url)
+            )
+            skipped_count += 1
+            processed_names.add(file_name)
+            continue
+
+        try:
+            updated_names = upload_existing_files_s3(file_name)
+            if updated_names:
+                migrated_count += len(updated_names)
+                processed_names.update(updated_names)
+            else:
+                skipped_count += 1
+                processed_names.add(file_name)
+        except Exception as e:
+            failed_count += 1
+            processed_names.add(file_name)
+            frappe.logger().error(
+                "Failed to migrate file {0}: {1}".format(file_name, str(e))
+            )
 
     summary_msg = frappe._("S3 Migration completed: {0} migrated, {1} skipped, {2} failed.").format(
         migrated_count, skipped_count, failed_count
