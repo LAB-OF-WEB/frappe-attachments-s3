@@ -47,6 +47,9 @@ class S3Operations(object):
             )
         self.BUCKET = self.s3_settings_doc.bucket_name
         self.folder_name = self.s3_settings_doc.folder_name
+        self.do_not_delete_local_files = getattr(
+            self.s3_settings_doc, 'do_not_delete_local_files', 0
+        )
 
     def strip_special_chars(self, file_name):
         """
@@ -352,12 +355,17 @@ def file_upload_to_s3(doc, method):
                 key
             )
 
-        # 2. Remove local file ONLY after DB commit succeeds
-        try:
-            os.remove(file_path)
-        except (OSError, FileNotFoundError) as e:
-            frappe.logger().warning(
-                "Could not remove local file {0} after S3 upload: {1}".format(file_path, str(e))
+        # 2. Remove local file ONLY after DB commit succeeds (if deletion is enabled)
+        if not s3_upload.do_not_delete_local_files:
+            try:
+                os.remove(file_path)
+            except (OSError, FileNotFoundError) as e:
+                frappe.logger().warning(
+                    "Could not remove local file {0} after S3 upload: {1}".format(file_path, str(e))
+                )
+        else:
+            frappe.logger().info(
+                "Local file retained on disk (do_not_delete_local_files enabled): {0}".format(file_path)
             )
 
 
@@ -422,12 +430,17 @@ def upload_existing_files_s3(name):
     # Update all File records sharing this file_url and commit DB
     updated_names = update_all_matching_file_records(path, doc.is_private, key, s3_upload)
 
-    # Remove local file after DB is committed.
-    try:
-        os.remove(file_path)
-    except (OSError, FileNotFoundError):
-        frappe.logger().warning(
-            "Local file already removed or inaccessible, skipping delete: {0}".format(file_path)
+    # Remove local file after DB is committed (if deletion is enabled).
+    if not s3_upload.do_not_delete_local_files:
+        try:
+            os.remove(file_path)
+        except (OSError, FileNotFoundError):
+            frappe.logger().warning(
+                "Local file already removed or inaccessible, skipping delete: {0}".format(file_path)
+            )
+    else:
+        frappe.logger().info(
+            "Local file retained on disk (do_not_delete_local_files enabled): {0}".format(file_path)
         )
 
     return updated_names
@@ -535,6 +548,143 @@ def delete_from_cloud(doc, method):
     """Delete file from s3"""
     s3 = S3Operations()
     s3.delete_from_s3(doc.content_hash)
+
+
+@frappe.whitelist()
+def restore_all_s3_files():
+    """
+    Function to enqueue background job to restore all S3 files back to disk without deleting from S3.
+    """
+    frappe.enqueue(
+        "frappe_s3_attachment.controller.process_restore_all_s3_files",
+        queue="long",
+        timeout=3600,
+        is_async=True,
+        user=frappe.session.user
+    )
+    return {
+        "status": "enqueued",
+        "message": frappe._("File restoration from S3 started in background.")
+    }
+
+
+def process_restore_all_s3_files(user=None):
+    """
+    Background worker to fetch all files from S3 back to local disk and revert database URLs.
+    Does NOT delete files from AWS S3.
+    """
+    site_path = frappe.utils.get_site_path()
+    s3_ops = S3Operations()
+    restored_count = 0
+    skipped_count = 0
+    failed_count = 0
+    processed_keys = set()
+
+    # 1. First restore all documented S3 File entries
+    try:
+        s3_files = frappe.get_all(
+            "S3 File",
+            filters={"status": ["!=", "Restored"]},
+            fields=["name", "s3_key"]
+        )
+        for s3_f in s3_files:
+            try:
+                s3_doc = frappe.get_doc("S3 File", s3_f["name"])
+                res = s3_doc.restore_to_disk()
+                if res.get("status") == "success":
+                    restored_count += 1
+                    processed_keys.add(s3_doc.s3_key)
+                elif res.get("status") == "already_restored":
+                    skipped_count += 1
+            except Exception as e:
+                failed_count += 1
+                frappe.logger().error(
+                    "Failed restoring S3 File {0}: {1}".format(s3_f["name"], str(e))
+                )
+    except Exception as e:
+        frappe.logger().warning(
+            "Could not query S3 File doctype for restore: {0}".format(str(e))
+        )
+
+    # 2. Restore any remaining legacy tabFile records with S3 URLs not tracked in S3 File
+    try:
+        all_files = frappe.get_all(
+            "File",
+            fields=["name", "file_name", "file_url", "is_private", "content_hash", "attached_to_doctype", "attached_to_name"]
+        )
+        for f in all_files:
+            url = f.get("file_url") or ""
+            if not s3_file_regex_match(url):
+                continue
+
+            key = f.get("content_hash")
+            if not key or "/" not in key:
+                if "/api/method/frappe_s3_attachment.controller.generate_file" in url:
+                    match = re.search(r"key=([^&]+)", url)
+                    if match:
+                        key = match.group(1)
+                elif s3_ops.BUCKET and s3_ops.BUCKET in url:
+                    parts = url.split(s3_ops.BUCKET + "/")
+                    if len(parts) > 1:
+                        key = parts[1]
+
+            if not key:
+                skipped_count += 1
+                continue
+
+            if key in processed_keys:
+                continue
+
+            # Determine local destination path
+            f_name = f.get("file_name") or os.path.basename(key)
+            local_url = "/files/" + f_name if not f.get("is_private") else "/private/files/" + f_name
+            local_file_path = site_path + ("/public" if not f.get("is_private") else "") + local_url
+
+            try:
+                os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
+                s3_obj = s3_ops.read_file_from_s3(key)
+                with open(local_file_path, "wb") as disk_file:
+                    disk_file.write(s3_obj["Body"].read())
+
+                frappe.db.sql(
+                    """UPDATE `tabFile` SET file_url=%s WHERE name=%s""",
+                    (local_url, f["name"])
+                )
+
+                if f.get("attached_to_doctype") and f.get("attached_to_name"):
+                    try:
+                        meta = frappe.get_meta(f["attached_to_doctype"])
+                        if meta and meta.get("image_field"):
+                            frappe.db.set_value(
+                                f["attached_to_doctype"],
+                                f["attached_to_name"],
+                                meta.get("image_field"),
+                                local_url
+                            )
+                    except Exception:
+                        pass
+
+                frappe.db.commit()
+                restored_count += 1
+                processed_keys.add(key)
+            except Exception as e:
+                failed_count += 1
+                frappe.logger().error(
+                    "Failed restoring file {0} from S3: {1}".format(f["name"], str(e))
+                )
+    except Exception as e:
+        frappe.logger().error("Error querying tabFile for legacy restore: {0}".format(str(e)))
+
+    summary_msg = frappe._("S3 Restore completed: {0} restored, {1} skipped, {2} failed.").format(
+        restored_count, skipped_count, failed_count
+    )
+    frappe.logger().info(summary_msg)
+
+    frappe.publish_realtime(
+        "s3_restore_complete",
+        {"message": summary_msg},
+        user=user
+    )
 
 
 @frappe.whitelist()
