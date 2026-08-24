@@ -193,10 +193,13 @@ class TestS3FileAttachment(unittest.TestCase):
         self, mock_get_all, mock_exists, mock_upload_existing, mock_publish
     ):
         frappe.utils.get_site_path.return_value = "/sites/mysite"
-        # Simulate 2 file records sharing the same physical file
-        mock_get_all.return_value = [
-            {"name": "FILE-001", "file_url": "/files/shared.pdf", "is_private": 0},
-            {"name": "FILE-002", "file_url": "/files/shared.pdf", "is_private": 0},
+        # Simulate batching with 2 file records sharing the same physical file
+        mock_get_all.side_effect = [
+            [
+                {"name": "FILE-001", "file_url": "/files/shared.pdf", "is_private": 0},
+                {"name": "FILE-002", "file_url": "/files/shared.pdf", "is_private": 0},
+            ],
+            []
         ]
         # When FILE-001 is processed, upload_existing_files_s3 updates BOTH FILE-001 and FILE-002
         mock_upload_existing.return_value = ["FILE-001", "FILE-002"]
@@ -216,3 +219,37 @@ class TestS3FileAttachment(unittest.TestCase):
         )
         self.assertFalse(s3_file_regex_match("/files/sample.pdf"))
         self.assertFalse(s3_file_regex_match("/private/files/sample.pdf"))
+
+    @patch("os.replace")
+    @patch("os.path.exists", return_value=True)
+    @patch("os.makedirs")
+    @patch("frappe_s3_attachment.controller.boto3.client")
+    def test_download_file_from_s3_streaming(
+        self, mock_boto_client, mock_makedirs, mock_exists, mock_replace
+    ):
+        from frappe_s3_attachment.controller import S3Operations
+        s3_client_mock = MagicMock()
+        mock_boto_client.return_value = s3_client_mock
+        frappe.get_doc.return_value = MagicMock(
+            aws_key="key",
+            aws_secret="secret",
+            region_name="us-east-1",
+            bucket_name="mybucket",
+            folder_name=None,
+            do_not_delete_local_files=0,
+            signed_url_expiry_time=120
+        )
+
+        ops = S3Operations()
+        ops.download_file_from_s3("2026/08/key.pdf", "/sites/mysite/public/files/key.pdf")
+
+        mock_makedirs.assert_called_once_with("/sites/mysite/public/files", exist_ok=True)
+        s3_client_mock.download_file.assert_called_once_with(
+            Bucket="mybucket",
+            Key="2026/08/key.pdf",
+            Filename="/sites/mysite/public/files/key.pdf.tmp"
+        )
+        mock_replace.assert_called_once_with(
+            "/sites/mysite/public/files/key.pdf.tmp",
+            "/sites/mysite/public/files/key.pdf"
+        )

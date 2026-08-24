@@ -34,19 +34,16 @@ class TestS3File(unittest.TestCase):
         frappe.utils.get_site_path = MagicMock(return_value="/sites/mysite")
         frappe.utils.now_datetime = MagicMock(return_value="2026-08-22 23:00:00")
 
-    @patch("builtins.open", create=True)
+    @patch("frappe.msgprint")
     @patch("os.makedirs")
     @patch("frappe.db.commit")
     @patch("frappe.db.set_value")
     @patch("frappe.db.sql")
     @patch("frappe_s3_attachment.frappe_s3_attachment.doctype.s3_file.s3_file.S3Operations")
     def test_restore_to_disk_public_file(
-        self, mock_s3_ops, mock_db_sql, mock_set_value, mock_commit, mock_makedirs, mock_open
+        self, mock_s3_ops, mock_db_sql, mock_set_value, mock_commit, mock_makedirs, mock_msgprint
     ):
         s3_inst = MagicMock()
-        mock_body = MagicMock()
-        mock_body.read.return_value = b"sample content bytes"
-        s3_inst.read_file_from_s3.return_value = {"Body": mock_body}
         mock_s3_ops.return_value = s3_inst
 
         doc = S3File()
@@ -73,6 +70,40 @@ class TestS3File(unittest.TestCase):
         self.assertEqual(doc.status, "Restored")
         self.assertEqual(link1.restored, 1)
         mock_makedirs.assert_called_once()
-        s3_inst.read_file_from_s3.assert_called_once_with("2026/08/22/Item/KEY_test.png")
+        s3_inst.download_file_from_s3.assert_called_once_with(
+            "2026/08/22/Item/KEY_test.png", "/sites/mysite/public/files/test.png"
+        )
         mock_set_value.assert_called_once_with("Item", "ITEM-001", "image", "/files/test.png")
+        mock_commit.assert_called_once()
+        mock_msgprint.assert_called_once()
+
+    @patch("frappe.msgprint")
+    @patch("os.makedirs")
+    @patch("frappe.db.commit")
+    @patch("frappe.db.set_value")
+    @patch("frappe.db.sql")
+    def test_restore_to_disk_batch_mode_reusable_client(
+        self, mock_db_sql, mock_set_value, mock_commit, mock_makedirs, mock_msgprint
+    ):
+        s3_inst = MagicMock()
+
+        doc = S3File()
+        doc.file_name = "test_batch.png"
+        doc.s3_key = "2026/08/22/Item/KEY_batch.png"
+        doc.original_file_url = "/files/test_batch.png"
+        doc.is_private = 0
+        doc.content_hash = "batchhash"
+        doc.status = "Active"
+        doc.save = MagicMock()
+        doc.links = []
+
+        res = doc.restore_to_disk(s3_operations=s3_inst, batch_mode=True)
+
+        self.assertEqual(res["status"], "success")
+        self.assertEqual(doc.status, "Restored")
+        s3_inst.download_file_from_s3.assert_called_once_with(
+            "2026/08/22/Item/KEY_batch.png", "/sites/mysite/public/files/test_batch.png"
+        )
+        # In batch mode, frappe.msgprint should not be called to avoid message_log memory bloat
+        mock_msgprint.assert_not_called()
         mock_commit.assert_called_once()

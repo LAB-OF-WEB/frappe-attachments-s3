@@ -12,16 +12,17 @@ from frappe_s3_attachment.controller import S3Operations
 class S3File(Document):
 
     @frappe.whitelist()
-    def restore_to_disk(self):
+    def restore_to_disk(self, s3_operations=None, batch_mode=False):
         """
         Download the object from AWS S3, write it back to the local server disk,
         and revert all modified tabFile records and DocType image fields back to original_file_url.
         """
         if self.status == "Restored":
-            frappe.msgprint(frappe._("This file has already been restored to disk."))
+            if not batch_mode:
+                frappe.msgprint(frappe._("This file has already been restored to disk."))
             return {"status": "already_restored"}
 
-        s3_upload = S3Operations()
+        s3_upload = s3_operations or S3Operations()
         site_path = frappe.utils.get_site_path()
 
         # Determine target local file path
@@ -33,13 +34,36 @@ class S3File(Document):
         # Ensure destination directory exists
         os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
 
-        # 1. Download file bytes from S3
+        # 1. Download file bytes from S3 using streaming to minimize memory usage
         try:
-            s3_obj = s3_upload.read_file_from_s3(self.s3_key)
-            file_body = s3_obj["Body"].read()
-            with open(local_file_path, "wb") as f:
-                f.write(file_body)
+            if hasattr(s3_upload, "download_file_from_s3"):
+                s3_upload.download_file_from_s3(self.s3_key, local_file_path)
+            else:
+                s3_obj = s3_upload.read_file_from_s3(self.s3_key)
+                body = s3_obj.get("Body") if isinstance(s3_obj, dict) else s3_obj
+                temp_file_path = local_file_path + ".tmp"
+                with open(temp_file_path, "wb") as f:
+                    if hasattr(body, "iter_chunks"):
+                        for chunk in body.iter_chunks(chunk_size=64 * 1024):
+                            if chunk:
+                                f.write(chunk)
+                    elif hasattr(body, "read"):
+                        while True:
+                            chunk = body.read(64 * 1024)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                    elif isinstance(body, (bytes, bytearray)):
+                        f.write(body)
+                if os.path.exists(temp_file_path):
+                    os.replace(temp_file_path, local_file_path)
         except Exception as e:
+            temp_file_path = local_file_path + ".tmp"
+            if os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                except OSError:
+                    pass
             frappe.logger().error(
                 "Failed to download and write file from S3 (key: {0}): {1}".format(self.s3_key, str(e))
             )
@@ -79,9 +103,10 @@ class S3File(Document):
         self.save(ignore_permissions=True)
         frappe.db.commit()
 
-        frappe.msgprint(
-            frappe._("File restored successfully to {0} and all database links reverted.").format(
-                self.original_file_url
+        if not batch_mode:
+            frappe.msgprint(
+                frappe._("File restored successfully to {0} and all database links reverted.").format(
+                    self.original_file_url
+                )
             )
-        )
         return {"status": "success", "file_path": local_file_path}

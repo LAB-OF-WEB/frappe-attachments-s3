@@ -181,6 +181,54 @@ class S3Operations(object):
         """
         return self.S3_CLIENT.get_object(Bucket=self.BUCKET, Key=key)
 
+    def download_file_from_s3(self, key, local_file_path):
+        """
+        Stream/download a file directly from S3 to disk without loading the entire file into memory.
+        Uses a temporary file with atomic replacement to prevent partial or corrupted files.
+        """
+        os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
+        temp_file_path = local_file_path + ".tmp"
+        try:
+            if hasattr(self.S3_CLIENT, "download_file"):
+                try:
+                    self.S3_CLIENT.download_file(
+                        Bucket=self.BUCKET,
+                        Key=key,
+                        Filename=temp_file_path
+                    )
+                    if os.path.exists(temp_file_path):
+                        os.replace(temp_file_path, local_file_path)
+                    return
+                except Exception:
+                    # Fallback to chunked streaming if download_file fails
+                    pass
+
+            s3_obj = self.read_file_from_s3(key)
+            body = s3_obj.get("Body") if isinstance(s3_obj, dict) else s3_obj
+            with open(temp_file_path, "wb") as f:
+                if hasattr(body, "iter_chunks"):
+                    for chunk in body.iter_chunks(chunk_size=64 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                elif hasattr(body, "read"):
+                    while True:
+                        chunk = body.read(64 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                elif isinstance(body, (bytes, bytearray)):
+                    f.write(body)
+
+            if os.path.exists(temp_file_path):
+                os.replace(temp_file_path, local_file_path)
+        except Exception:
+            if os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                except OSError:
+                    pass
+            raise
+
     def get_url(self, key, file_name=None):
         """
         Return url.
@@ -464,7 +512,7 @@ def migrate_existing_files():
     frappe.enqueue(
         "frappe_s3_attachment.controller.process_files_migration",
         queue="long",
-        timeout=3600,
+        timeout=86400,
         is_async=True,
         user=frappe.session.user
     )
@@ -477,7 +525,10 @@ def migrate_existing_files():
 def process_files_migration(user=None):
     """
     Background worker to migrate existing files to s3 with S3 Migration audit logging.
+    Optimized for high memory efficiency: processes in batches, clears document caches, and limits warning memory.
     """
+    import gc
+
     start_time = datetime.datetime.now()
     migration_doc = None
     try:
@@ -491,93 +542,136 @@ def process_files_migration(user=None):
     except Exception as e:
         frappe.logger().warning("Could not initialize S3 Migration log: {0}".format(str(e)))
 
-    files_list = frappe.get_all(
-        'File',
-        fields=['name', 'file_url', 'is_private']
-    )
     site_path = frappe.utils.get_site_path()
     migrated_count = 0
     skipped_count = 0
     failed_count = 0
     processed_names = set()
-    total_files_scanned = len(files_list)
+    total_files_scanned = 0
+    MAX_WARNING_ENTRIES = 500
+    warning_count = 0
 
-    for file in files_list:
-        file_name = file['name']
-        if file_name in processed_names:
-            continue
+    def add_warning(file_doc, file_name, file_url, log_type, reason):
+        nonlocal warning_count
+        if not migration_doc:
+            return
+        if warning_count < MAX_WARNING_ENTRIES:
+            migration_doc.append("warnings_and_errors", {
+                "file_doc": file_doc,
+                "file_name": file_name,
+                "file_url": file_url,
+                "log_type": log_type,
+                "reason": reason
+            })
+            warning_count += 1
+        elif warning_count == MAX_WARNING_ENTRIES:
+            migration_doc.append("warnings_and_errors", {
+                "file_doc": "...",
+                "file_name": "...",
+                "file_url": "",
+                "log_type": "Skipped",
+                "reason": "Further warning/error details omitted to prevent memory exhaustion. See total counts."
+            })
+            warning_count += 1
 
-        file_url = file.get('file_url')
-        if not file_url:
-            skipped_count += 1
-            processed_names.add(file_name)
-            if migration_doc:
-                migration_doc.append("warnings_and_errors", {
-                    "file_doc": file_name,
-                    "file_name": file_name,
-                    "file_url": "",
-                    "log_type": "Skipped",
-                    "reason": "Empty file_url in tabFile"
-                })
-            continue
+    def cleanup_memory():
+        if hasattr(frappe.local, "document_cache") and isinstance(frappe.local.document_cache, dict):
+            frappe.local.document_cache.clear()
+        if hasattr(frappe.local, "doc_cache") and isinstance(frappe.local.doc_cache, dict):
+            frappe.local.doc_cache.clear()
+        if hasattr(frappe.local, "message_log") and isinstance(frappe.local.message_log, list):
+            frappe.local.message_log.clear()
+        gc.collect()
 
-        if s3_file_regex_match(file_url):
-            processed_names.add(file_name)
-            continue
+    BATCH_SIZE = 500
+    last_name = ""
 
-        # Check if local file exists
-        if file.get('is_private'):
-            file_path = site_path + file_url
-        else:
-            file_path = site_path + '/public' + file_url
+    while True:
+        filters = {}
+        if last_name:
+            filters["name"] = [">", last_name]
 
-        if not os.path.exists(file_path):
-            frappe.logger().warning(
-                "Skipping missing file on disk: {0} ({1})".format(file_name, file_url)
-            )
-            skipped_count += 1
-            processed_names.add(file_name)
-            if migration_doc:
-                migration_doc.append("warnings_and_errors", {
-                    "file_doc": file_name,
-                    "file_name": os.path.basename(file_url),
-                    "file_url": file_url,
-                    "log_type": "Skipped",
-                    "reason": "Physical file not found on local disk: {0}".format(file_path)
-                })
-            continue
+        files_list = frappe.get_all(
+            'File',
+            filters=filters,
+            fields=['name', 'file_url', 'is_private'],
+            order_by="name asc",
+            limit_page_length=BATCH_SIZE
+        )
+        if not files_list:
+            break
 
-        try:
-            updated_names = upload_existing_files_s3(file_name)
-            if updated_names:
-                migrated_count += len(updated_names)
-                processed_names.update(updated_names)
-            else:
+        total_files_scanned += len(files_list)
+
+        for file in files_list:
+            file_name = file['name']
+            last_name = file_name
+            if file_name in processed_names:
+                continue
+
+            file_url = file.get('file_url')
+            if not file_url:
                 skipped_count += 1
                 processed_names.add(file_name)
-                if migration_doc:
-                    migration_doc.append("warnings_and_errors", {
-                        "file_doc": file_name,
-                        "file_name": os.path.basename(file_url),
-                        "file_url": file_url,
-                        "log_type": "Skipped",
-                        "reason": "upload_existing_files_s3 returned empty"
-                    })
-        except Exception as e:
-            failed_count += 1
-            processed_names.add(file_name)
-            error_msg = str(e)
-            frappe.logger().error(
-                "Failed to migrate file {0}: {1}".format(file_name, error_msg)
-            )
-            if migration_doc:
-                migration_doc.append("warnings_and_errors", {
-                    "file_doc": file_name,
-                    "file_name": os.path.basename(file_url),
-                    "file_url": file_url,
-                    "log_type": "Error",
-                    "reason": error_msg
-                })
+                add_warning(file_name, file_name, "", "Skipped", "Empty file_url in tabFile")
+                continue
+
+            if s3_file_regex_match(file_url):
+                processed_names.add(file_name)
+                continue
+
+            # Check if local file exists
+            if file.get('is_private'):
+                file_path = site_path + file_url
+            else:
+                file_path = site_path + '/public' + file_url
+
+            if not os.path.exists(file_path):
+                frappe.logger().warning(
+                    "Skipping missing file on disk: {0} ({1})".format(file_name, file_url)
+                )
+                skipped_count += 1
+                processed_names.add(file_name)
+                add_warning(
+                    file_name,
+                    os.path.basename(file_url),
+                    file_url,
+                    "Skipped",
+                    "Physical file not found on local disk: {0}".format(file_path)
+                )
+                continue
+
+            try:
+                updated_names = upload_existing_files_s3(file_name)
+                if updated_names:
+                    migrated_count += len(updated_names)
+                    processed_names.update(updated_names)
+                else:
+                    skipped_count += 1
+                    processed_names.add(file_name)
+                    add_warning(
+                        file_name,
+                        os.path.basename(file_url),
+                        file_url,
+                        "Skipped",
+                        "upload_existing_files_s3 returned empty"
+                    )
+            except Exception as e:
+                failed_count += 1
+                processed_names.add(file_name)
+                error_msg = str(e)
+                frappe.logger().error(
+                    "Failed to migrate file {0}: {1}".format(file_name, error_msg)
+                )
+                add_warning(
+                    file_name,
+                    os.path.basename(file_url),
+                    file_url,
+                    "Error",
+                    error_msg
+                )
+
+        cleanup_memory()
 
     end_time = datetime.datetime.now()
     duration_secs = (end_time - start_time).total_seconds()
@@ -630,7 +724,7 @@ def restore_all_s3_files():
     frappe.enqueue(
         "frappe_s3_attachment.controller.process_restore_all_s3_files",
         queue="long",
-        timeout=3600,
+        timeout=86400,
         is_async=True,
         user=frappe.session.user
     )
@@ -644,7 +738,10 @@ def process_restore_all_s3_files(user=None):
     """
     Background worker to fetch all files from S3 back to local disk and revert database URLs with S3 Migration audit logging.
     Does NOT delete files from AWS S3.
+    Optimized for high memory efficiency: streams file downloads, processes in batches, clears document caches, and limits warning memory.
     """
+    import gc
+
     start_time = datetime.datetime.now()
     migration_doc = None
     try:
@@ -663,48 +760,97 @@ def process_restore_all_s3_files(user=None):
     restored_count = 0
     skipped_count = 0
     failed_count = 0
-    processed_keys = set()
     total_files_scanned = 0
+    MAX_WARNING_ENTRIES = 500
+    warning_count = 0
 
-    # 1. First restore all documented S3 File entries
+    def add_warning(file_doc, file_name, file_url, log_type, reason):
+        nonlocal warning_count
+        if not migration_doc:
+            return
+        if warning_count < MAX_WARNING_ENTRIES:
+            migration_doc.append("warnings_and_errors", {
+                "file_doc": file_doc,
+                "file_name": file_name,
+                "file_url": file_url,
+                "log_type": log_type,
+                "reason": reason
+            })
+            warning_count += 1
+        elif warning_count == MAX_WARNING_ENTRIES:
+            migration_doc.append("warnings_and_errors", {
+                "file_doc": "...",
+                "file_name": "...",
+                "file_url": "",
+                "log_type": "Skipped",
+                "reason": "Further warning/error details omitted to prevent memory exhaustion. See total counts."
+            })
+            warning_count += 1
+
+    def cleanup_memory():
+        if hasattr(frappe.local, "document_cache") and isinstance(frappe.local.document_cache, dict):
+            frappe.local.document_cache.clear()
+        if hasattr(frappe.local, "doc_cache") and isinstance(frappe.local.doc_cache, dict):
+            frappe.local.doc_cache.clear()
+        if hasattr(frappe.local, "message_log") and isinstance(frappe.local.message_log, list):
+            frappe.local.message_log.clear()
+        gc.collect()
+
+    BATCH_SIZE = 500
+
+    # 1. First restore all documented S3 File entries in batches using keyset pagination
     try:
-        s3_files = frappe.get_all(
-            "S3 File",
-            filters={"status": ["!=", "Restored"]},
-            fields=["name", "s3_key", "original_file_url", "file_name"]
-        )
-        total_files_scanned += len(s3_files)
-        for s3_f in s3_files:
-            try:
-                s3_doc = frappe.get_doc("S3 File", s3_f["name"])
-                res = s3_doc.restore_to_disk()
-                if res.get("status") == "success":
-                    restored_count += 1
-                    processed_keys.add(s3_doc.s3_key)
-                elif res.get("status") == "already_restored":
-                    skipped_count += 1
-                    if migration_doc:
-                        migration_doc.append("warnings_and_errors", {
-                            "file_doc": s3_f["name"],
-                            "file_name": s3_f.get("file_name") or s3_doc.file_name,
-                            "file_url": s3_doc.original_file_url,
-                            "log_type": "Skipped",
-                            "reason": "File already marked as Restored"
-                        })
-            except Exception as e:
-                failed_count += 1
-                error_msg = str(e)
-                frappe.logger().error(
-                    "Failed restoring S3 File {0}: {1}".format(s3_f["name"], error_msg)
-                )
-                if migration_doc:
-                    migration_doc.append("warnings_and_errors", {
-                        "file_doc": s3_f["name"],
-                        "file_name": s3_f.get("file_name") or "",
-                        "file_url": s3_f.get("original_file_url") or "",
-                        "log_type": "Error",
-                        "reason": error_msg
-                    })
+        last_name = ""
+        while True:
+            filters = {"status": ["!=", "Restored"]}
+            if last_name:
+                filters["name"] = [">", last_name]
+
+            s3_files_batch = frappe.get_all(
+                "S3 File",
+                filters=filters,
+                fields=["name", "s3_key", "original_file_url", "file_name"],
+                order_by="name asc",
+                limit_page_length=BATCH_SIZE
+            )
+
+            if not s3_files_batch:
+                break
+
+            total_files_scanned += len(s3_files_batch)
+
+            for s3_f in s3_files_batch:
+                last_name = s3_f["name"]
+                try:
+                    s3_doc = frappe.get_doc("S3 File", s3_f["name"])
+                    res = s3_doc.restore_to_disk(s3_operations=s3_ops, batch_mode=True)
+                    if res.get("status") == "success":
+                        restored_count += 1
+                    elif res.get("status") == "already_restored":
+                        skipped_count += 1
+                        add_warning(
+                            s3_f["name"],
+                            s3_f.get("file_name") or s3_doc.file_name,
+                            s3_doc.original_file_url,
+                            "Skipped",
+                            "File already marked as Restored"
+                        )
+                except Exception as e:
+                    failed_count += 1
+                    error_msg = str(e)
+                    frappe.logger().error(
+                        "Failed restoring S3 File {0}: {1}".format(s3_f["name"], error_msg)
+                    )
+                    add_warning(
+                        s3_f["name"],
+                        s3_f.get("file_name") or "",
+                        s3_f.get("original_file_url") or "",
+                        "Error",
+                        error_msg
+                    )
+
+            cleanup_memory()
+
     except Exception as e:
         frappe.logger().warning(
             "Could not query S3 File doctype for restore: {0}".format(str(e))
@@ -712,88 +858,104 @@ def process_restore_all_s3_files(user=None):
 
     # 2. Restore any remaining legacy tabFile records with S3 URLs not tracked in S3 File
     try:
-        all_files = frappe.get_all(
-            "File",
-            fields=["name", "file_name", "file_url", "is_private", "content_hash", "attached_to_doctype", "attached_to_name"]
-        )
-        for f in all_files:
-            url = f.get("file_url") or ""
-            if not s3_file_regex_match(url):
-                continue
+        last_file_name = ""
+        bucket_pattern = "%{}%".format(s3_ops.BUCKET) if s3_ops.BUCKET else "%"
 
-            total_files_scanned += 1
-            key = f.get("content_hash")
-            if not key or "/" not in key:
-                if "/api/method/frappe_s3_attachment.controller.generate_file" in url:
-                    match = re.search(r"key=([^&]+)", url)
-                    if match:
-                        key = match.group(1)
-                elif s3_ops.BUCKET and s3_ops.BUCKET in url:
-                    parts = url.split(s3_ops.BUCKET + "/")
-                    if len(parts) > 1:
-                        key = parts[1]
+        while True:
+            # Query candidate File records matching S3 URLs in batches using keyset pagination
+            candidate_files = frappe.db.sql(
+                """
+                SELECT name, file_name, file_url, is_private, content_hash, attached_to_doctype, attached_to_name
+                FROM `tabFile`
+                WHERE name > %s
+                  AND (
+                    file_url LIKE '/api/method/frappe_s3_attachment%%'
+                    OR (file_url LIKE %s AND (file_url LIKE 'http://%%' OR file_url LIKE 'https://%%'))
+                    OR (content_hash LIKE '%%/%%' AND (file_url LIKE 'http://%%' OR file_url LIKE 'https://%%'))
+                  )
+                ORDER BY name ASC
+                LIMIT %s
+                """,
+                (last_file_name, bucket_pattern, BATCH_SIZE),
+                as_dict=True
+            )
 
-            if not key:
-                skipped_count += 1
-                if migration_doc:
-                    migration_doc.append("warnings_and_errors", {
-                        "file_doc": f["name"],
-                        "file_name": f.get("file_name") or "",
-                        "file_url": url,
-                        "log_type": "Skipped",
-                        "reason": "Could not determine S3 key from File record"
-                    })
-                continue
+            if not candidate_files:
+                break
 
-            if key in processed_keys:
-                continue
+            for f in candidate_files:
+                last_file_name = f["name"]
+                url = f.get("file_url") or ""
+                if not s3_file_regex_match(url):
+                    continue
 
-            # Determine local destination path
-            f_name = f.get("file_name") or os.path.basename(key)
-            local_url = "/files/" + f_name if not f.get("is_private") else "/private/files/" + f_name
-            local_file_path = site_path + ("/public" if not f.get("is_private") else "") + local_url
+                total_files_scanned += 1
+                key = f.get("content_hash")
+                if not key or "/" not in key:
+                    if "/api/method/frappe_s3_attachment.controller.generate_file" in url:
+                        match = re.search(r"key=([^&]+)", url)
+                        if match:
+                            key = match.group(1)
+                    elif s3_ops.BUCKET and s3_ops.BUCKET in url:
+                        parts = url.split(s3_ops.BUCKET + "/")
+                        if len(parts) > 1:
+                            key = parts[1]
 
-            try:
-                os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
-                s3_obj = s3_ops.read_file_from_s3(key)
-                with open(local_file_path, "wb") as disk_file:
-                    disk_file.write(s3_obj["Body"].read())
+                if not key:
+                    skipped_count += 1
+                    add_warning(
+                        f["name"],
+                        f.get("file_name") or "",
+                        url,
+                        "Skipped",
+                        "Could not determine S3 key from File record"
+                    )
+                    continue
 
-                frappe.db.sql(
-                    """UPDATE `tabFile` SET file_url=%s WHERE name=%s""",
-                    (local_url, f["name"])
-                )
+                # Determine local destination path
+                f_name = f.get("file_name") or os.path.basename(key)
+                local_url = "/files/" + f_name if not f.get("is_private") else "/private/files/" + f_name
+                local_file_path = site_path + ("/public" if not f.get("is_private") else "") + local_url
 
-                if f.get("attached_to_doctype") and f.get("attached_to_name"):
-                    try:
-                        meta = frappe.get_meta(f["attached_to_doctype"])
-                        if meta and meta.get("image_field"):
-                            frappe.db.set_value(
-                                f["attached_to_doctype"],
-                                f["attached_to_name"],
-                                meta.get("image_field"),
-                                local_url
-                            )
-                    except Exception:
-                        pass
+                try:
+                    s3_ops.download_file_from_s3(key, local_file_path)
 
-                frappe.db.commit()
-                restored_count += 1
-                processed_keys.add(key)
-            except Exception as e:
-                failed_count += 1
-                error_msg = str(e)
-                frappe.logger().error(
-                    "Failed restoring file {0} from S3: {1}".format(f["name"], error_msg)
-                )
-                if migration_doc:
-                    migration_doc.append("warnings_and_errors", {
-                        "file_doc": f["name"],
-                        "file_name": f.get("file_name") or "",
-                        "file_url": url,
-                        "log_type": "Error",
-                        "reason": error_msg
-                    })
+                    frappe.db.sql(
+                        """UPDATE `tabFile` SET file_url=%s WHERE name=%s""",
+                        (local_url, f["name"])
+                    )
+
+                    if f.get("attached_to_doctype") and f.get("attached_to_name"):
+                        try:
+                            meta = frappe.get_meta(f["attached_to_doctype"])
+                            if meta and meta.get("image_field"):
+                                frappe.db.set_value(
+                                    f["attached_to_doctype"],
+                                    f["attached_to_name"],
+                                    meta.get("image_field"),
+                                    local_url
+                                )
+                        except Exception:
+                            pass
+
+                    frappe.db.commit()
+                    restored_count += 1
+                except Exception as e:
+                    failed_count += 1
+                    error_msg = str(e)
+                    frappe.logger().error(
+                        "Failed restoring file {0} from S3: {1}".format(f["name"], error_msg)
+                    )
+                    add_warning(
+                        f["name"],
+                        f.get("file_name") or "",
+                        url,
+                        "Error",
+                        error_msg
+                    )
+
+            cleanup_memory()
+
     except Exception as e:
         frappe.logger().error("Error querying tabFile for legacy restore: {0}".format(str(e)))
 
