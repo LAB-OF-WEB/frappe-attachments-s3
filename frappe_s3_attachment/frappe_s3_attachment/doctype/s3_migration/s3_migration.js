@@ -62,6 +62,29 @@ frappe.ui.form.on('S3 Migration', {
 				]),
 				'blue'
 			);
+		} else if (frm.doc.status === 'Completed') {
+			frm.dashboard.set_headline(
+				__('Job Completed: {0} files processed successfully.', [
+					frm.doc.successful_files || 0
+				]),
+				'green'
+			);
+		} else if (frm.doc.status === 'Completed with Warnings') {
+			frm.dashboard.set_headline(
+				__('Job Completed with Warnings: {0} succeeded, {1} skipped, {2} failed.', [
+					frm.doc.successful_files || 0,
+					frm.doc.skipped_files || 0,
+					frm.doc.failed_files || 0
+				]),
+				'orange'
+			);
+		} else if (frm.doc.status === 'Failed') {
+			frm.dashboard.set_headline(
+				__('Job Failed: {0}', [
+					frm.doc.current_phase || __('Error encountered')
+				]),
+				'red'
+			);
 		}
 	}
 });

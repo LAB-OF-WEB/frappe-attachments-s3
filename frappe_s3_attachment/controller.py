@@ -762,26 +762,40 @@ def process_files_migration(user=None):
 
     def add_warning(file_doc, file_name, file_url, log_type, reason):
         nonlocal warning_count
-        if not migration_doc:
+        if not migration_doc_name:
             return
         if warning_count < MAX_WARNING_ENTRIES:
-            migration_doc.append("warnings_and_errors", {
-                "file_doc": file_doc,
-                "file_name": file_name,
-                "file_url": file_url,
-                "log_type": log_type,
-                "reason": reason
-            })
-            warning_count += 1
+            try:
+                w_doc = frappe.new_doc("S3 Migration Warning")
+                w_doc.parent = migration_doc_name
+                w_doc.parenttype = "S3 Migration"
+                w_doc.parentfield = "warnings_and_errors"
+                w_doc.file_doc = file_doc
+                w_doc.file_name = file_name
+                w_doc.file_url = file_url
+                w_doc.log_type = log_type
+                w_doc.reason = str(reason)[:500]
+                w_doc.insert(ignore_permissions=True)
+                frappe.db.commit()
+                warning_count += 1
+            except Exception:
+                pass
         elif warning_count == MAX_WARNING_ENTRIES:
-            migration_doc.append("warnings_and_errors", {
-                "file_doc": "...",
-                "file_name": "...",
-                "file_url": "",
-                "log_type": "Skipped",
-                "reason": "Further warning/error details omitted to prevent memory exhaustion. See total counts."
-            })
-            warning_count += 1
+            try:
+                w_doc = frappe.new_doc("S3 Migration Warning")
+                w_doc.parent = migration_doc_name
+                w_doc.parenttype = "S3 Migration"
+                w_doc.parentfield = "warnings_and_errors"
+                w_doc.file_doc = "..."
+                w_doc.file_name = "..."
+                w_doc.file_url = ""
+                w_doc.log_type = "Skipped"
+                w_doc.reason = "Further warning/error details omitted to prevent memory exhaustion. See total counts."
+                w_doc.insert(ignore_permissions=True)
+                frappe.db.commit()
+                warning_count += 1
+            except Exception:
+                pass
 
     def cleanup_memory():
         if hasattr(frappe.local, "document_cache") and isinstance(frappe.local.document_cache, dict):
@@ -944,29 +958,52 @@ def process_files_migration(user=None):
     )
     frappe.logger().info(summary_msg)
 
-    if migration_doc:
+    final_status = "Completed"
+    if failed_count == 0 and skipped_count == 0:
+        final_status = "Completed"
+    elif migrated_count == 0 and failed_count > 0:
+        final_status = "Failed"
+    else:
+        final_status = "Completed with Warnings"
+
+    if migration_doc_name:
         try:
-            migration_doc.completed_at = frappe.utils.now_datetime()
-            migration_doc.duration_seconds = duration_secs
-            migration_doc.total_files_scanned = total_files_scanned
-            migration_doc.successful_files = migrated_count
-            migration_doc.skipped_files = skipped_count
-            migration_doc.failed_files = failed_count
-            migration_doc.progress_percentage = 100.0
-            migration_doc.current_phase = "Completed"
-            migration_doc.current_file = ""
-            migration_doc.last_heartbeat = frappe.utils.now_datetime()
-            migration_doc.log_summary = summary_msg
-            if failed_count == 0 and skipped_count == 0:
-                migration_doc.status = "Completed"
-            elif migrated_count == 0 and failed_count > 0:
-                migration_doc.status = "Failed"
-            else:
-                migration_doc.status = "Completed with Warnings"
-            migration_doc.save(ignore_permissions=True)
+            now_dt = frappe.utils.now_datetime()
+            frappe.db.sql(
+                """
+                UPDATE `tabS3 Migration`
+                SET status = %s,
+                    current_phase = 'Completed',
+                    current_file = '',
+                    progress_percentage = 100.0,
+                    completed_at = %s,
+                    duration_seconds = %s,
+                    total_files_scanned = %s,
+                    successful_files = %s,
+                    skipped_files = %s,
+                    failed_files = %s,
+                    last_heartbeat = %s,
+                    log_summary = %s,
+                    modified = %s
+                WHERE name = %s
+                """,
+                (
+                    final_status,
+                    now_dt,
+                    duration_secs,
+                    total_files_scanned,
+                    migrated_count,
+                    skipped_count,
+                    failed_count,
+                    now_dt,
+                    summary_msg,
+                    now_dt,
+                    migration_doc_name
+                )
+            )
             frappe.db.commit()
         except Exception as e:
-            frappe.logger().warning("Could not finalize S3 Migration log: {0}".format(str(e)))
+            frappe.logger().error("Could not finalize S3 Migration log: {0}".format(str(e)))
 
     frappe.publish_realtime(
         "s3_migration_complete",
@@ -1060,26 +1097,40 @@ def process_restore_all_s3_files(user=None):
 
     def add_warning(file_doc, file_name, file_url, log_type, reason):
         nonlocal warning_count
-        if not migration_doc:
+        if not migration_doc_name:
             return
         if warning_count < MAX_WARNING_ENTRIES:
-            migration_doc.append("warnings_and_errors", {
-                "file_doc": file_doc,
-                "file_name": file_name,
-                "file_url": file_url,
-                "log_type": log_type,
-                "reason": reason
-            })
-            warning_count += 1
+            try:
+                w_doc = frappe.new_doc("S3 Migration Warning")
+                w_doc.parent = migration_doc_name
+                w_doc.parenttype = "S3 Migration"
+                w_doc.parentfield = "warnings_and_errors"
+                w_doc.file_doc = file_doc
+                w_doc.file_name = file_name
+                w_doc.file_url = file_url
+                w_doc.log_type = log_type
+                w_doc.reason = str(reason)[:500]
+                w_doc.insert(ignore_permissions=True)
+                frappe.db.commit()
+                warning_count += 1
+            except Exception:
+                pass
         elif warning_count == MAX_WARNING_ENTRIES:
-            migration_doc.append("warnings_and_errors", {
-                "file_doc": "...",
-                "file_name": "...",
-                "file_url": "",
-                "log_type": "Skipped",
-                "reason": "Further warning/error details omitted to prevent memory exhaustion. See total counts."
-            })
-            warning_count += 1
+            try:
+                w_doc = frappe.new_doc("S3 Migration Warning")
+                w_doc.parent = migration_doc_name
+                w_doc.parenttype = "S3 Migration"
+                w_doc.parentfield = "warnings_and_errors"
+                w_doc.file_doc = "..."
+                w_doc.file_name = "..."
+                w_doc.file_url = ""
+                w_doc.log_type = "Skipped"
+                w_doc.reason = "Further warning/error details omitted to prevent memory exhaustion. See total counts."
+                w_doc.insert(ignore_permissions=True)
+                frappe.db.commit()
+                warning_count += 1
+            except Exception:
+                pass
 
     def cleanup_memory():
         if hasattr(frappe.local, "document_cache") and isinstance(frappe.local.document_cache, dict):
@@ -1402,29 +1453,52 @@ def process_restore_all_s3_files(user=None):
     )
     frappe.logger().info(summary_msg)
 
-    if migration_doc:
+    final_status = "Completed"
+    if failed_count == 0 and skipped_count == 0:
+        final_status = "Completed"
+    elif restored_count == 0 and failed_count > 0:
+        final_status = "Failed"
+    else:
+        final_status = "Completed with Warnings"
+
+    if migration_doc_name:
         try:
-            migration_doc.completed_at = frappe.utils.now_datetime()
-            migration_doc.duration_seconds = duration_secs
-            migration_doc.total_files_scanned = total_files_scanned
-            migration_doc.successful_files = restored_count
-            migration_doc.skipped_files = skipped_count
-            migration_doc.failed_files = failed_count
-            migration_doc.progress_percentage = 100.0
-            migration_doc.current_phase = "Completed"
-            migration_doc.current_file = ""
-            migration_doc.last_heartbeat = frappe.utils.now_datetime()
-            migration_doc.log_summary = summary_msg
-            if failed_count == 0 and skipped_count == 0:
-                migration_doc.status = "Completed"
-            elif restored_count == 0 and failed_count > 0:
-                migration_doc.status = "Failed"
-            else:
-                migration_doc.status = "Completed with Warnings"
-            migration_doc.save(ignore_permissions=True)
+            now_dt = frappe.utils.now_datetime()
+            frappe.db.sql(
+                """
+                UPDATE `tabS3 Migration`
+                SET status = %s,
+                    current_phase = 'Completed',
+                    current_file = '',
+                    progress_percentage = 100.0,
+                    completed_at = %s,
+                    duration_seconds = %s,
+                    total_files_scanned = %s,
+                    successful_files = %s,
+                    skipped_files = %s,
+                    failed_files = %s,
+                    last_heartbeat = %s,
+                    log_summary = %s,
+                    modified = %s
+                WHERE name = %s
+                """,
+                (
+                    final_status,
+                    now_dt,
+                    duration_secs,
+                    total_files_scanned,
+                    restored_count,
+                    skipped_count,
+                    failed_count,
+                    now_dt,
+                    summary_msg,
+                    now_dt,
+                    migration_doc_name
+                )
+            )
             frappe.db.commit()
         except Exception as e:
-            frappe.logger().warning("Could not finalize S3 Migration restore log: {0}".format(str(e)))
+            frappe.logger().error("Could not finalize S3 Migration restore log: {0}".format(str(e)))
 
     frappe.publish_realtime(
         "s3_restore_complete",
