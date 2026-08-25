@@ -6,7 +6,7 @@ from __future__ import unicode_literals
 import os
 import frappe
 from frappe.model.document import Document
-from frappe_s3_attachment.controller import S3Operations
+from frappe_s3_attachment.controller import S3Operations, get_local_filepath
 
 
 class S3File(Document):
@@ -25,11 +25,10 @@ class S3File(Document):
         s3_upload = s3_operations or S3Operations()
         site_path = frappe.utils.get_site_path()
 
-        # Determine target local file path
-        if not self.is_private:
-            local_file_path = site_path + "/public" + self.original_file_url
-        else:
-            local_file_path = site_path + self.original_file_url
+        # Determine target local file path safely using normalized path resolver
+        local_file_path, normalized_db_url = get_local_filepath(
+            self.original_file_url, self.is_private, site_path
+        )
 
         # Ensure destination directory exists
         os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
@@ -74,7 +73,7 @@ class S3File(Document):
             if link.file_doc:
                 frappe.db.sql(
                     """UPDATE `tabFile` SET file_url=%s, content_hash=%s WHERE name=%s""",
-                    (self.original_file_url, self.content_hash, link.file_doc),
+                    (normalized_db_url, self.content_hash, link.file_doc),
                 )
             if link.attached_to_doctype and link.attached_to_name and link.image_field:
                 try:
@@ -82,7 +81,7 @@ class S3File(Document):
                         link.attached_to_doctype,
                         link.attached_to_name,
                         link.image_field,
-                        self.original_file_url,
+                        normalized_db_url,
                     )
                 except Exception as e:
                     frappe.logger().warning(
@@ -95,7 +94,7 @@ class S3File(Document):
         # Also revert any matching tabFile records where content_hash or file_url matches the S3 key
         frappe.db.sql(
             """UPDATE `tabFile` SET file_url=%s, content_hash=%s WHERE content_hash=%s""",
-            (self.original_file_url, self.content_hash, self.s3_key),
+            (normalized_db_url, self.content_hash, self.s3_key),
         )
 
         self.status = "Restored"
@@ -106,7 +105,7 @@ class S3File(Document):
         if not batch_mode:
             frappe.msgprint(
                 frappe._("File restored successfully to {0} and all database links reverted.").format(
-                    self.original_file_url
+                    normalized_db_url
                 )
             )
         return {"status": "success", "file_path": local_file_path}

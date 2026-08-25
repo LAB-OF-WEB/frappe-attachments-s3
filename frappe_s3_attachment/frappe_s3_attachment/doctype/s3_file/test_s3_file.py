@@ -107,3 +107,34 @@ class TestS3File(unittest.TestCase):
         # In batch mode, frappe.msgprint should not be called to avoid message_log memory bloat
         mock_msgprint.assert_not_called()
         mock_commit.assert_called_once()
+
+    @patch("frappe.msgprint")
+    @patch("os.makedirs")
+    @patch("frappe.db.commit")
+    @patch("frappe.db.set_value")
+    @patch("frappe.db.sql")
+    def test_restore_to_disk_private_file(
+        self, mock_db_sql, mock_set_value, mock_commit, mock_makedirs, mock_msgprint
+    ):
+        s3_inst = MagicMock()
+
+        doc = S3File()
+        doc.file_name = "secret.pdf"
+        doc.s3_key = "2026/08/22/Doc/KEY_secret.pdf"
+        doc.original_file_url = "/private/files/secret.pdf"
+        doc.is_private = 1
+        doc.content_hash = "secrethash"
+        doc.status = "Active"
+        doc.save = MagicMock()
+        doc.links = []
+
+        res = doc.restore_to_disk(s3_operations=s3_inst, batch_mode=True)
+
+        self.assertEqual(res["status"], "success")
+        self.assertEqual(doc.status, "Restored")
+        # Private file should be placed in /sites/mysite/private/files/secret.pdf
+        s3_inst.download_file_from_s3.assert_called_once_with(
+            "2026/08/22/Doc/KEY_secret.pdf",
+            os.path.join("/sites/mysite", "private", "files", "secret.pdf")
+        )
+        mock_commit.assert_called_once()

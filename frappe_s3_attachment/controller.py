@@ -12,9 +12,53 @@ from botocore.client import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 import frappe
-
-
 import magic
+
+try:
+    from urllib.parse import unquote_plus
+except ImportError:
+    from urllib import unquote_plus
+
+
+def get_local_filepath(file_url_or_name, is_private, site_path=None):
+    """
+    Safely resolves the absolute disk file path and clean database URL for a restored file,
+    correctly handling all variations of public and private file URLs and leading/trailing slashes.
+    """
+    site_path = site_path or frappe.utils.get_site_path()
+    clean_url = (file_url_or_name or "").replace("\\", "/").strip().lstrip("/")
+
+    if is_private:
+        # Private files must strictly live in <site_path>/private/files/
+        if clean_url.startswith("private/files/"):
+            rel_path = clean_url
+        elif clean_url.startswith("private/"):
+            rel_path = "private/files/" + clean_url[len("private/"):].lstrip("/")
+        elif clean_url.startswith("files/"):
+            rel_path = "private/files/" + clean_url[len("files/"):].lstrip("/")
+        else:
+            rel_path = "private/files/" + clean_url
+
+        db_url = "/" + rel_path
+        abs_path = os.path.join(site_path, rel_path)
+    else:
+        # Public files must strictly live in <site_path>/public/files/
+        if clean_url.startswith("public/files/"):
+            rel_path = clean_url
+            db_url = "/" + clean_url[len("public/"):].lstrip("/")
+        elif clean_url.startswith("public/"):
+            rel_path = "public/files/" + clean_url[len("public/"):].lstrip("/")
+            db_url = "/files/" + clean_url[len("public/"):].lstrip("/")
+        elif clean_url.startswith("files/"):
+            rel_path = "public/" + clean_url
+            db_url = "/" + clean_url
+        else:
+            rel_path = "public/files/" + clean_url
+            db_url = "/files/" + clean_url
+
+        abs_path = os.path.join(site_path, rel_path)
+
+    return abs_path, db_url
 
 
 class S3Operations(object):
@@ -257,10 +301,11 @@ class S3Operations(object):
         return url
 
 
-def update_all_matching_file_records(original_path, is_private, key, s3_upload):
+def update_all_matching_file_records(original_path, is_private, key, s3_upload, existing_s3_doc_name=None):
     """
     Find and update all tabFile records matching the exact original file_url and is_private status,
     including updating attached doctypes with image_fields and logging to S3 File.
+    Supports updating existing S3 File records during re-migration to prevent duplicate docs.
     """
     matching_files = frappe.get_all(
         'File',
@@ -325,24 +370,35 @@ def update_all_matching_file_records(original_path, is_private, key, s3_upload):
         })
         updated_names.append(name)
 
-    # Create S3 File tracking entry for full visibility and restoration capability
+    # Create or update S3 File tracking entry for full visibility and restoration capability
     try:
-        s3_file_doc = frappe.new_doc('S3 File')
-        s3_file_doc.file_name = os.path.basename(original_path)
-        s3_file_doc.s3_key = key
-        s3_file_doc.bucket_name = s3_upload.BUCKET
-        s3_file_doc.original_file_url = original_path
-        s3_file_doc.s3_url = primary_s3_url
-        s3_file_doc.content_hash = original_hash or ""
-        s3_file_doc.is_private = 1 if is_private else 0
-        s3_file_doc.status = "Active"
-        s3_file_doc.migrated_at = frappe.utils.now_datetime()
-        for item in links_data:
-            s3_file_doc.append("links", item)
-        s3_file_doc.insert(ignore_permissions=True)
+        if existing_s3_doc_name:
+            s3_file_doc = frappe.get_doc("S3 File", existing_s3_doc_name)
+            s3_file_doc.s3_key = key
+            s3_file_doc.s3_url = primary_s3_url
+            s3_file_doc.status = "Active"
+            s3_file_doc.migrated_at = frappe.utils.now_datetime()
+            s3_file_doc.set("links", [])
+            for item in links_data:
+                s3_file_doc.append("links", item)
+            s3_file_doc.save(ignore_permissions=True)
+        else:
+            s3_file_doc = frappe.new_doc('S3 File')
+            s3_file_doc.file_name = os.path.basename(original_path)
+            s3_file_doc.s3_key = key
+            s3_file_doc.bucket_name = s3_upload.BUCKET
+            s3_file_doc.original_file_url = original_path
+            s3_file_doc.s3_url = primary_s3_url
+            s3_file_doc.content_hash = original_hash or ""
+            s3_file_doc.is_private = 1 if is_private else 0
+            s3_file_doc.status = "Active"
+            s3_file_doc.migrated_at = frappe.utils.now_datetime()
+            for item in links_data:
+                s3_file_doc.append("links", item)
+            s3_file_doc.insert(ignore_permissions=True)
     except Exception as e:
         frappe.logger().warning(
-            "Could not create S3 File tracking record for key {0}: {1}".format(key, str(e))
+            "Could not create/update S3 File tracking record for key {0}: {1}".format(key, str(e))
         )
 
     frappe.db.commit()
@@ -368,10 +424,7 @@ def file_upload_to_s3(doc, method):
     parent_name = doc.attached_to_name
     ignore_s3_upload_for_doctype = frappe.local.conf.get('ignore_s3_upload_for_doctype') or ['Data Import']
     if parent_doctype not in ignore_s3_upload_for_doctype:
-        if not doc.is_private:
-            file_path = site_path + '/public' + path
-        else:
-            file_path = site_path + path
+        file_path, _ = get_local_filepath(path, doc.is_private, site_path)
 
         if not os.path.exists(file_path):
             frappe.logger().warning(
@@ -435,6 +488,7 @@ def generate_file(key=None, file_name=None):
 def upload_existing_files_s3(name):
     """
     Function to upload an existing file and update all File records sharing its file_url.
+    Supports smart re-migration by reusing existing intact S3 objects when available.
     Returns list of updated File doc names.
     """
     file_doc_name = frappe.db.get_value('File', {'name': name})
@@ -450,10 +504,7 @@ def upload_existing_files_s3(name):
     site_path = frappe.utils.get_site_path()
     parent_doctype = doc.attached_to_doctype
     parent_name = doc.attached_to_name
-    if not doc.is_private:
-        file_path = site_path + '/public' + path
-    else:
-        file_path = site_path + path
+    file_path, _ = get_local_filepath(path, doc.is_private, site_path)
 
     # File exists?
     if not os.path.exists(file_path):
@@ -462,21 +513,43 @@ def upload_existing_files_s3(name):
         )
         return []
 
-    key = s3_upload.upload_files_to_s3_with_key(
-        file_path, doc.file_name,
-        doc.is_private, parent_doctype,
-        parent_name
-    )
-
-    # Verify object was written to S3 before database update and local file deletion
-    if not s3_upload.verify_s3_object_exists(key):
-        frappe.logger().error(
-            "S3 verification failed for existing file {0} (key: {1}). Skipping local deletion.".format(doc.name, key)
+    # Check if this file already has an S3 File tracking record (e.g. was restored from S3 earlier)
+    existing_s3_doc_name = None
+    existing_s3_key = None
+    try:
+        s3_matches = frappe.get_all(
+            "S3 File",
+            filters={"original_file_url": path, "is_private": 1 if doc.is_private else 0},
+            fields=["name", "s3_key", "status"],
+            limit_page_length=1
         )
-        return []
+        if s3_matches:
+            existing_s3_doc_name = s3_matches[0]["name"]
+            existing_s3_key = s3_matches[0]["s3_key"]
+    except Exception:
+        pass
+
+    # If the S3 object already exists intact in S3, we can reuse it (instant re-migration)
+    if existing_s3_key and s3_upload.verify_s3_object_exists(existing_s3_key):
+        key = existing_s3_key
+    else:
+        key = s3_upload.upload_files_to_s3_with_key(
+            file_path, doc.file_name,
+            doc.is_private, parent_doctype,
+            parent_name
+        )
+
+        # Verify object was written to S3 before database update and local file deletion
+        if not s3_upload.verify_s3_object_exists(key):
+            frappe.logger().error(
+                "S3 verification failed for existing file {0} (key: {1}). Skipping local deletion.".format(doc.name, key)
+            )
+            return []
 
     # Update all File records sharing this file_url and commit DB
-    updated_names = update_all_matching_file_records(path, doc.is_private, key, s3_upload)
+    updated_names = update_all_matching_file_records(
+        path, doc.is_private, key, s3_upload, existing_s3_doc_name=existing_s3_doc_name
+    )
 
     # Remove local file after DB is committed (if deletion is enabled).
     if not s3_upload.do_not_delete_local_files:
@@ -496,10 +569,12 @@ def upload_existing_files_s3(name):
 
 def s3_file_regex_match(file_url):
     """
-    Match the public file regex match.
+    Match the public file regex match. Supports http, https, and generate_file API endpoint.
     """
+    if not file_url:
+        return None
     return re.match(
-        r'^(https:|/api/method/frappe_s3_attachment.controller.generate_file)',
+        r'^(https?:|/api/method/frappe_s3_attachment.controller.generate_file)',
         file_url
     )
 
@@ -1133,7 +1208,7 @@ def process_restore_all_s3_files(user=None):
                         if "/api/method/frappe_s3_attachment.controller.generate_file" in url:
                             match = re.search(r"key=([^&]+)", url)
                             if match:
-                                key = match.group(1)
+                                key = unquote_plus(match.group(1))
                         elif s3_ops.BUCKET and s3_ops.BUCKET in url:
                             parts = url.split(s3_ops.BUCKET + "/")
                             if len(parts) > 1:
@@ -1150,10 +1225,24 @@ def process_restore_all_s3_files(user=None):
                         )
                         continue
 
-                    # Determine local destination path
+                    # Determine local destination path safely using normalized path resolver
                     f_name = f.get("file_name") or os.path.basename(key)
-                    local_url = "/files/" + f_name if not f.get("is_private") else "/private/files/" + f_name
-                    local_file_path = site_path + ("/public" if not f.get("is_private") else "") + local_url
+                    local_file_path, local_url = get_local_filepath(
+                        f_name,
+                        f.get("is_private"),
+                        site_path
+                    )
+
+                    # Collision avoidance: If a different file already exists at local_file_path, use unique key name
+                    if os.path.exists(local_file_path):
+                        key_base = os.path.basename(key)
+                        if key_base and key_base != f_name:
+                            f_name = key_base
+                            local_file_path, local_url = get_local_filepath(
+                                f_name,
+                                f.get("is_private"),
+                                site_path
+                            )
 
                     try:
                         s3_ops.download_file_from_s3(key, local_file_path)
@@ -1163,18 +1252,47 @@ def process_restore_all_s3_files(user=None):
                             (local_url, f["name"])
                         )
 
+                        image_field_name = None
                         if f.get("attached_to_doctype") and f.get("attached_to_name"):
                             try:
                                 meta = frappe.get_meta(f["attached_to_doctype"])
                                 if meta and meta.get("image_field"):
+                                    image_field_name = meta.get("image_field")
                                     frappe.db.set_value(
                                         f["attached_to_doctype"],
                                         f["attached_to_name"],
-                                        meta.get("image_field"),
+                                        image_field_name,
                                         local_url
                                     )
                             except Exception:
                                 pass
+
+                        # Upgrade legacy file to tracked S3 File record (status = Restored) for two-way reversibility
+                        try:
+                            legacy_s3_file = frappe.new_doc("S3 File")
+                            legacy_s3_file.file_name = f_name
+                            legacy_s3_file.s3_key = key
+                            legacy_s3_file.bucket_name = s3_ops.BUCKET
+                            legacy_s3_file.original_file_url = local_url
+                            legacy_s3_file.s3_url = url
+                            legacy_s3_file.content_hash = key
+                            legacy_s3_file.is_private = 1 if f.get("is_private") else 0
+                            legacy_s3_file.status = "Restored"
+                            legacy_s3_file.restored_at = frappe.utils.now_datetime()
+                            legacy_s3_file.append("links", {
+                                "file_doc": f["name"],
+                                "attached_to_doctype": f.get("attached_to_doctype"),
+                                "attached_to_name": f.get("attached_to_name"),
+                                "image_field": image_field_name,
+                                "original_value": local_url,
+                                "s3_value": url,
+                                "restored": 1
+                            })
+                            legacy_s3_file.insert(ignore_permissions=True)
+                        except Exception as s3f_err:
+                            frappe.logger().warning(
+                                "Could not create S3 File tracking entry for legacy file {0}: {1}".format(f["name"], str(s3f_err))
+                            )
 
                         frappe.db.commit()
                         restored_count += 1

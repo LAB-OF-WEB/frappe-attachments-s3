@@ -287,3 +287,101 @@ class TestS3FileAttachment(unittest.TestCase):
         self.assertEqual(event_payload["migration_doc"], "S3MIG-00001")
         self.assertEqual(event_payload["progress_percentage"], 50.0)
         self.assertEqual(event_payload["successful_files"], 45)
+
+    def test_s3_file_regex_match_http_and_https(self):
+        self.assertTrue(s3_file_regex_match("https://s3.amazonaws.com/bucket/key.pdf"))
+        self.assertTrue(s3_file_regex_match("http://s3.amazonaws.com/bucket/key.pdf"))
+        self.assertTrue(s3_file_regex_match("http://localhost:9000/bucket/key.pdf"))
+        self.assertTrue(
+            s3_file_regex_match(
+                "/api/method/frappe_s3_attachment.controller.generate_file?key=123"
+            )
+        )
+        self.assertFalse(s3_file_regex_match("/files/sample.pdf"))
+        self.assertFalse(s3_file_regex_match("/private/files/sample.pdf"))
+        self.assertIsNone(s3_file_regex_match(""))
+        self.assertIsNone(s3_file_regex_match(None))
+
+    def test_get_local_filepath_normalization(self):
+        from frappe_s3_attachment.controller import get_local_filepath
+        site_path = "/sites/mysite"
+
+        # Public tests
+        p1, u1 = get_local_filepath("/files/image.png", is_private=0, site_path=site_path)
+        self.assertEqual(p1.replace("\\", "/"), "/sites/mysite/public/files/image.png")
+        self.assertEqual(u1, "/files/image.png")
+
+        p2, u2 = get_local_filepath("files/image.png", is_private=0, site_path=site_path)
+        self.assertEqual(p2.replace("\\", "/"), "/sites/mysite/public/files/image.png")
+        self.assertEqual(u2, "/files/image.png")
+
+        p3, u3 = get_local_filepath("/public/files/image.png", is_private=0, site_path=site_path)
+        self.assertEqual(p3.replace("\\", "/"), "/sites/mysite/public/files/image.png")
+        self.assertEqual(u3, "/files/image.png")
+
+        # Private tests
+        pr1, ur1 = get_local_filepath("/private/files/doc.pdf", is_private=1, site_path=site_path)
+        self.assertEqual(pr1.replace("\\", "/"), "/sites/mysite/private/files/doc.pdf")
+        self.assertEqual(ur1, "/private/files/doc.pdf")
+
+        pr2, ur2 = get_local_filepath("private/files/doc.pdf", is_private=1, site_path=site_path)
+        self.assertEqual(pr2.replace("\\", "/"), "/sites/mysite/private/files/doc.pdf")
+        self.assertEqual(ur2, "/private/files/doc.pdf")
+
+        pr3, ur3 = get_local_filepath("/files/doc.pdf", is_private=1, site_path=site_path)
+        self.assertEqual(pr3.replace("\\", "/"), "/sites/mysite/private/files/doc.pdf")
+        self.assertEqual(ur3, "/private/files/doc.pdf")
+
+    @patch("os.remove")
+    @patch("os.path.exists", return_value=True)
+    @patch("frappe.get_doc")
+    @patch("frappe.db.get_value", return_value="FILE-001")
+    @patch("frappe.get_all")
+    def test_smart_remigration_reuses_existing_s3_file(
+        self, mock_get_all, mock_get_value, mock_get_doc, mock_exists, mock_remove
+    ):
+        from frappe_s3_attachment.controller import upload_existing_files_s3
+        frappe.utils.get_site_path.return_value = "/sites/mysite"
+
+        mock_file_doc = MagicMock()
+        mock_file_doc.name = "FILE-001"
+        mock_file_doc.file_url = "/files/reused.pdf"
+        mock_file_doc.file_name = "reused.pdf"
+        mock_file_doc.is_private = 0
+        mock_file_doc.attached_to_doctype = "Item"
+        mock_file_doc.attached_to_name = "ITEM-001"
+        mock_get_doc.return_value = mock_file_doc
+
+        # Return existing S3 File record
+        mock_get_all.side_effect = [
+            [{"name": "S3F-0001", "s3_key": "2026/08/reused.pdf", "status": "Restored"}], # S3 File query
+            [{"name": "FILE-001", "file_name": "reused.pdf", "attached_to_doctype": None, "attached_to_name": None, "is_private": 0, "content_hash": None}] # matching files
+        ]
+
+        with patch("frappe_s3_attachment.controller.S3Operations") as mock_s3_ops_cls:
+            mock_s3_inst = MagicMock()
+            mock_s3_inst.BUCKET = "test-bucket"
+            mock_s3_inst.do_not_delete_local_files = 0
+            mock_s3_inst.S3_CLIENT.meta.endpoint_url = "https://s3.amazonaws.com"
+            mock_s3_inst.verify_s3_object_exists.return_value = True
+            mock_s3_ops_cls.return_value = mock_s3_inst
+
+            existing_s3_doc_mock = MagicMock()
+            def get_doc_side_effect(doctype, name):
+                if doctype == "File":
+                    return mock_file_doc
+                if doctype == "S3 File":
+                    return existing_s3_doc_mock
+                return MagicMock()
+            mock_get_doc.side_effect = get_doc_side_effect
+
+            updated = upload_existing_files_s3("FILE-001")
+            self.assertIn("FILE-001", updated)
+
+            # verify_s3_object_exists should be called for existing key
+            mock_s3_inst.verify_s3_object_exists.assert_called_with("2026/08/reused.pdf")
+            # upload_files_to_s3_with_key should NOT be called since object was already on S3
+            mock_s3_inst.upload_files_to_s3_with_key.assert_not_called()
+            # Existing S3 File doc status should be updated to Active
+            self.assertEqual(existing_s3_doc_mock.status, "Active")
+            existing_s3_doc_mock.save.assert_called_once()
