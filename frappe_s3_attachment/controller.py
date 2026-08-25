@@ -95,6 +95,12 @@ class S3Operations(object):
         self.do_not_delete_local_files = getattr(
             self.s3_settings_doc, 'do_not_delete_local_files', 0
         )
+        self.disable_s3_upload = getattr(
+            self.s3_settings_doc, 'disable_s3_upload', 0
+        )
+        self.do_not_change_file_url = getattr(
+            self.s3_settings_doc, 'do_not_change_file_url', 0
+        )
 
     def strip_special_chars(self, file_name):
         """
@@ -307,6 +313,7 @@ def update_all_matching_file_records(original_path, is_private, key, s3_upload, 
     Find and update all tabFile records matching the exact original file_url and is_private status,
     including updating attached doctypes with image_fields and logging to S3 File.
     Supports updating existing S3 File records during re-migration to prevent duplicate docs.
+    Respects do_not_change_file_url setting to keep local URLs while recording S3 backup in S3 File.
     """
     matching_files = frappe.get_all(
         'File',
@@ -321,6 +328,7 @@ def update_all_matching_file_records(original_path, is_private, key, s3_upload, 
     links_data = []
     primary_s3_url = ""
     original_hash = None
+    do_not_change_url = getattr(s3_upload, "do_not_change_file_url", 0)
 
     for file_info in matching_files:
         name = file_info['name']
@@ -332,33 +340,40 @@ def update_all_matching_file_records(original_path, is_private, key, s3_upload, 
 
         if is_private:
             method = "frappe_s3_attachment.controller.generate_file"
-            file_url = """/api/method/{0}?key={1}&file_name={2}""".format(method, key, f_name)
+            s3_file_url = """/api/method/{0}?key={1}&file_name={2}""".format(method, key, f_name)
         else:
-            file_url = '{}/{}/{}'.format(
+            s3_file_url = '{}/{}/{}'.format(
                 s3_upload.S3_CLIENT.meta.endpoint_url,
                 s3_upload.BUCKET,
                 key
             )
         if not primary_s3_url:
-            primary_s3_url = file_url
-
-        frappe.db.sql(
-            """UPDATE `tabFile` SET file_url=%s, folder=%s,
-            old_parent=%s, content_hash=%s WHERE name=%s""",
-            (file_url, 'Home/Attachments', 'Home/Attachments', key, name)
-        )
+            primary_s3_url = s3_file_url
 
         image_field_name = None
-        if attached_doctype and attached_name:
-            try:
-                meta = frappe.get_meta(attached_doctype)
-                if meta and meta.get('image_field'):
-                    image_field_name = meta.get('image_field')
-                    frappe.db.set_value(attached_doctype, attached_name, image_field_name, file_url)
-            except Exception as e:
-                frappe.logger().warning(
-                    "Could not update image_field for {0} {1}: {2}".format(attached_doctype, attached_name, str(e))
-                )
+        if not do_not_change_url:
+            frappe.db.sql(
+                """UPDATE `tabFile` SET file_url=%s, folder=%s,
+                old_parent=%s, content_hash=%s WHERE name=%s""",
+                (s3_file_url, 'Home/Attachments', 'Home/Attachments', key, name)
+            )
+
+            if attached_doctype and attached_name:
+                try:
+                    meta = frappe.get_meta(attached_doctype)
+                    if meta and meta.get('image_field'):
+                        image_field_name = meta.get('image_field')
+                        frappe.db.set_value(attached_doctype, attached_name, image_field_name, s3_file_url)
+                except Exception as e:
+                    frappe.logger().warning(
+                        "Could not update image_field for {0} {1}: {2}".format(attached_doctype, attached_name, str(e))
+                    )
+        else:
+            # When do_not_change_file_url is enabled, keep local URL and record content_hash
+            frappe.db.sql(
+                """UPDATE `tabFile` SET content_hash=%s WHERE name=%s""",
+                (key, name)
+            )
 
         links_data.append({
             "file_doc": name,
@@ -366,7 +381,7 @@ def update_all_matching_file_records(original_path, is_private, key, s3_upload, 
             "attached_to_name": attached_name,
             "image_field": image_field_name,
             "original_value": original_path,
-            "s3_value": file_url,
+            "s3_value": s3_file_url,
             "restored": 0
         })
         updated_names.append(name)
@@ -412,6 +427,10 @@ def file_upload_to_s3(doc, method):
     check and upload files to s3 with resilient atomic ordering, updating all duplicate/shared references.
     """
     s3_upload = S3Operations()
+    if s3_upload.disable_s3_upload:
+        frappe.logger().info("S3 upload is disabled in S3 File Attachment settings. Skipping upload.")
+        return
+
     path = doc.file_url
     if not path:
         return
@@ -446,19 +465,20 @@ def file_upload_to_s3(doc, method):
         # 1. Update ALL tabFile records sharing this exact file_url and commit
         update_all_matching_file_records(path, doc.is_private, key, s3_upload)
 
-        # Sync current in-memory doc
-        if doc.is_private:
-            method_path = "frappe_s3_attachment.controller.generate_file"
-            doc.file_url = """/api/method/{0}?key={1}&file_name={2}""".format(method_path, key, doc.file_name)
-        else:
-            doc.file_url = '{}/{}/{}'.format(
-                s3_upload.S3_CLIENT.meta.endpoint_url,
-                s3_upload.BUCKET,
-                key
-            )
+        # Sync current in-memory doc (only change URL if do_not_change_file_url is not set)
+        if not s3_upload.do_not_change_file_url:
+            if doc.is_private:
+                method_path = "frappe_s3_attachment.controller.generate_file"
+                doc.file_url = """/api/method/{0}?key={1}&file_name={2}""".format(method_path, key, doc.file_name)
+            else:
+                doc.file_url = '{}/{}/{}'.format(
+                    s3_upload.S3_CLIENT.meta.endpoint_url,
+                    s3_upload.BUCKET,
+                    key
+                )
 
-        # 2. Remove local file ONLY after DB commit succeeds (if deletion is enabled)
-        if not s3_upload.do_not_delete_local_files:
+        # 2. Remove local file ONLY after DB commit succeeds (if deletion is enabled and URL was changed to S3)
+        if not s3_upload.do_not_delete_local_files and not s3_upload.do_not_change_file_url:
             try:
                 os.remove(file_path)
             except (OSError, FileNotFoundError) as e:
@@ -467,7 +487,7 @@ def file_upload_to_s3(doc, method):
                 )
         else:
             frappe.logger().info(
-                "Local file retained on disk (do_not_delete_local_files enabled): {0}".format(file_path)
+                "Local file retained on disk: {0}".format(file_path)
             )
 
 
@@ -490,8 +510,14 @@ def upload_existing_files_s3(name):
     """
     Function to upload an existing file and update all File records sharing its file_url.
     Supports smart re-migration by reusing existing intact S3 objects when available.
+    Respects disable_s3_upload and do_not_change_file_url settings.
     Returns list of updated File doc names.
     """
+    s3_upload = S3Operations()
+    if s3_upload.disable_s3_upload:
+        frappe.logger().info("S3 upload is disabled in S3 File Attachment settings. Skipping file.")
+        return []
+
     file_doc_name = frappe.db.get_value('File', {'name': name})
     if not file_doc_name:
         return []
@@ -501,7 +527,6 @@ def upload_existing_files_s3(name):
     if not path or s3_file_regex_match(path):
         return []
 
-    s3_upload = S3Operations()
     site_path = frappe.utils.get_site_path()
     parent_doctype = doc.attached_to_doctype
     parent_name = doc.attached_to_name
@@ -552,8 +577,8 @@ def upload_existing_files_s3(name):
         path, doc.is_private, key, s3_upload, existing_s3_doc_name=existing_s3_doc_name
     )
 
-    # Remove local file after DB is committed (if deletion is enabled).
-    if not s3_upload.do_not_delete_local_files:
+    # Remove local file after DB is committed (if deletion is enabled and URL was changed).
+    if not s3_upload.do_not_delete_local_files and not s3_upload.do_not_change_file_url:
         try:
             os.remove(file_path)
         except (OSError, FileNotFoundError):
@@ -562,7 +587,7 @@ def upload_existing_files_s3(name):
             )
     else:
         frappe.logger().info(
-            "Local file retained on disk (do_not_delete_local_files enabled): {0}".format(file_path)
+            "Local file retained on disk: {0}".format(file_path)
         )
 
     return updated_names
@@ -585,6 +610,13 @@ def migrate_existing_files():
     """
     Function to enqueue migration of existing files to s3 in background.
     """
+    s3_upload = S3Operations()
+    if s3_upload.disable_s3_upload:
+        return {
+            "status": "disabled",
+            "message": frappe._("S3 upload is currently disabled in S3 File Attachment settings.")
+        }
+
     frappe.enqueue(
         "frappe_s3_attachment.controller.process_files_migration",
         queue="long",

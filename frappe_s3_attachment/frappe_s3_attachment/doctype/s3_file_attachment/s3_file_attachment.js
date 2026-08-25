@@ -27,6 +27,8 @@ frappe.ui.form.on('S3 File Attachment', {
 								message: __('File migration has been enqueued in the background. You will be notified when complete.'),
 								indicator: 'green'
 							}, 7);
+						} else if (r.message && r.message.status === 'disabled') {
+							frappe.msgprint(r.message.message || __('S3 upload is currently disabled in settings.'));
 						} else {
 							frappe.msgprint(__('Unable to queue migration job. Please check error logs.'));
 						}

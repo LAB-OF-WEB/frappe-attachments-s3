@@ -385,3 +385,63 @@ class TestS3FileAttachment(unittest.TestCase):
             # Existing S3 File doc status should be updated to Active
             self.assertEqual(existing_s3_doc_mock.status, "Active")
             existing_s3_doc_mock.save.assert_called_once()
+
+    @patch("frappe_s3_attachment.controller.S3Operations")
+    def test_disable_s3_upload_skips_upload(self, mock_s3_ops_cls):
+        from frappe_s3_attachment.controller import file_upload_to_s3, upload_existing_files_s3
+        s3_inst = MagicMock()
+        s3_inst.disable_s3_upload = 1
+        mock_s3_ops_cls.return_value = s3_inst
+
+        doc = MagicMock()
+        doc.file_url = "/files/test.png"
+        doc.is_private = 0
+        file_upload_to_s3(doc, "after_insert")
+
+        # S3 upload functions should never be called when disable_s3_upload is True
+        s3_inst.upload_files_to_s3_with_key.assert_not_called()
+
+        res = upload_existing_files_s3("FILE-001")
+        self.assertEqual(res, [])
+
+    @patch("os.remove")
+    @patch("os.path.exists", return_value=True)
+    @patch("frappe.get_doc")
+    @patch("frappe.get_all", return_value=[{"name": "FILE-001", "file_name": "test.png", "attached_to_doctype": None, "attached_to_name": None, "is_private": 0, "content_hash": "hash123"}])
+    @patch("frappe.new_doc")
+    @patch("frappe.db.sql")
+    def test_do_not_change_file_url_keeps_local_url_and_file(
+        self, mock_sql, mock_new_doc, mock_get_all, mock_get_doc, mock_exists, mock_remove
+    ):
+        from frappe_s3_attachment.controller import file_upload_to_s3
+        frappe.utils.get_site_path.return_value = "/sites/mysite"
+        frappe.local.conf.get.return_value = []
+
+        doc = MagicMock()
+        doc.name = "FILE-001"
+        doc.file_url = "/files/local_serve.png"
+        doc.file_name = "local_serve.png"
+        doc.is_private = 0
+        doc.attached_to_doctype = None
+        doc.attached_to_name = None
+
+        with patch("frappe_s3_attachment.controller.S3Operations") as mock_s3_ops_cls:
+            s3_inst = MagicMock()
+            s3_inst.disable_s3_upload = 0
+            s3_inst.do_not_change_file_url = 1
+            s3_inst.do_not_delete_local_files = 0  # Even if deletion is not checked, file should be preserved!
+            s3_inst.BUCKET = "test-bucket"
+            s3_inst.S3_CLIENT.meta.endpoint_url = "https://s3.amazonaws.com"
+            s3_inst.upload_files_to_s3_with_key.return_value = "2026/08/local_serve.png"
+            s3_inst.verify_s3_object_exists.return_value = True
+            mock_s3_ops_cls.return_value = s3_inst
+
+            file_upload_to_s3(doc, "after_insert")
+
+            # Local file must NOT be deleted
+            mock_remove.assert_not_called()
+            # doc.file_url must NOT be changed to S3 URL
+            self.assertEqual(doc.file_url, "/files/local_serve.png")
+            # S3 File record should still be created for tracking
+            mock_new_doc.assert_called_with("S3 File")
+
