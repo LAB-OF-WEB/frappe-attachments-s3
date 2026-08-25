@@ -253,3 +253,37 @@ class TestS3FileAttachment(unittest.TestCase):
             "/sites/mysite/public/files/key.pdf.tmp",
             "/sites/mysite/public/files/key.pdf"
         )
+
+    @patch("frappe.publish_realtime")
+    @patch("frappe.db.commit")
+    @patch("frappe.db.sql")
+    def test_update_migration_progress(self, mock_sql, mock_commit, mock_publish):
+        from frappe_s3_attachment.controller import update_migration_progress
+        frappe.utils.now_datetime = MagicMock(return_value="2026-08-25 13:45:00")
+
+        update_migration_progress(
+            migration_doc_name="S3MIG-00001",
+            current_phase="Phase 1/2: Restoring S3 File entries",
+            current_file="S3F-0001: test.png",
+            total_scanned=50,
+            successful=45,
+            skipped=3,
+            failed=2,
+            total_expected=100,
+            user="Administrator"
+        )
+
+        mock_sql.assert_called_once()
+        sql_query = mock_sql.call_args[0][0]
+        self.assertIn("UPDATE `tabS3 Migration`", sql_query)
+        self.assertIn("current_phase = %s", sql_query)
+        self.assertIn("progress_percentage = %s", sql_query)
+        mock_commit.assert_called_once()
+
+        mock_publish.assert_called_once()
+        event_name = mock_publish.call_args[0][0]
+        event_payload = mock_publish.call_args[0][1]
+        self.assertEqual(event_name, "s3_migration_progress")
+        self.assertEqual(event_payload["migration_doc"], "S3MIG-00001")
+        self.assertEqual(event_payload["progress_percentage"], 50.0)
+        self.assertEqual(event_payload["successful_files"], 45)
