@@ -6,14 +6,15 @@ frappe.ui.form.on('S3 Migration', {
 		frappe.realtime.off('s3_migration_progress');
 		frappe.realtime.on('s3_migration_progress', function(data) {
 			if (data && data.migration_doc === frm.doc.name) {
-				frm.set_value('current_phase', data.current_phase || '');
-				frm.set_value('current_file', data.current_file || '');
-				frm.set_value('total_files_scanned', data.total_files_scanned || 0);
-				frm.set_value('successful_files', data.successful_files || 0);
-				frm.set_value('skipped_files', data.skipped_files || 0);
-				frm.set_value('failed_files', data.failed_files || 0);
-				frm.set_value('progress_percentage', data.progress_percentage || 0);
-				frm.set_value('last_heartbeat', data.last_heartbeat || '');
+				frm.doc.current_phase = data.current_phase || '';
+				frm.doc.current_file = data.current_file || '';
+				frm.doc.total_files_scanned = data.total_files_scanned || 0;
+				frm.doc.successful_files = data.successful_files || 0;
+				frm.doc.skipped_files = data.skipped_files || 0;
+				frm.doc.failed_files = data.failed_files || 0;
+				frm.doc.progress_percentage = data.progress_percentage || 0;
+				frm.doc.last_heartbeat = data.last_heartbeat || '';
+
 				frm.refresh_fields([
 					'current_phase',
 					'current_file',
@@ -24,6 +25,17 @@ frappe.ui.form.on('S3 Migration', {
 					'progress_percentage',
 					'last_heartbeat'
 				]);
+
+				if (frm.dashboard) {
+					frm.dashboard.set_headline(
+						__('Job is running ({0}%): {1} - {2}', [
+							data.progress_percentage || 0,
+							data.current_phase || __('In Progress'),
+							data.current_file || ''
+						]),
+						'blue'
+					);
+				}
 			}
 		});
 
@@ -43,7 +55,8 @@ frappe.ui.form.on('S3 Migration', {
 
 		if (frm.doc.status === 'In Progress') {
 			frm.dashboard.set_headline(
-				__('Job is running: {0} - {1}', [
+				__('Job is running ({0}%): {1} - {2}', [
+					frm.doc.progress_percentage || 0,
 					frm.doc.current_phase || __('Initializing...'),
 					frm.doc.current_file || ''
 				]),

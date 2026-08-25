@@ -5,6 +5,7 @@ import os
 import random
 import re
 import string
+import time
 
 import boto3
 
@@ -597,6 +598,9 @@ def migrate_existing_files():
     }
 
 
+_last_progress_update = {}
+
+
 def update_migration_progress(
     migration_doc_name,
     current_phase,
@@ -606,15 +610,24 @@ def update_migration_progress(
     skipped,
     failed,
     total_expected=0,
-    user=None
+    user=None,
+    force=False,
+    min_interval_seconds=1.5
 ):
     """
     Directly updates the S3 Migration document in the database with current status and heartbeat.
     Commits immediately so that progress is visible in Desk and persisted even if the worker is killed.
+    Throttles Socket.IO and DB writes to at most once every min_interval_seconds to prevent event flooding.
     """
     if not migration_doc_name:
         return
 
+    now_ts = time.time()
+    last_ts = _last_progress_update.get(migration_doc_name, 0)
+    if not force and (now_ts - last_ts < min_interval_seconds):
+        return
+
+    _last_progress_update[migration_doc_name] = now_ts
     now = frappe.utils.now_datetime()
     progress_pct = 0.0
     if total_expected and total_expected > 0:
@@ -654,7 +667,7 @@ def update_migration_progress(
             "Could not update live migration progress for {0}: {1}".format(migration_doc_name, str(e))
         )
 
-    # Emit realtime event for live UI update
+    # Emit socket.io realtime event for live UI update inside S3 Migration form
     try:
         frappe.publish_realtime(
             "s3_migration_progress",
@@ -757,7 +770,8 @@ def process_files_migration(user=None):
             "Starting batch scan...",
             0, 0, 0, 0,
             total_expected=total_expected,
-            user=user
+            user=user,
+            force=True
         )
 
         while True:
@@ -868,7 +882,8 @@ def process_files_migration(user=None):
                 skipped_count,
                 failed_count,
                 total_expected=total_expected,
-                user=user
+                user=user,
+                force=True
             )
             cleanup_memory()
 
@@ -1057,7 +1072,8 @@ def process_restore_all_s3_files(user=None):
                 skipped_count,
                 failed_count,
                 total_expected=total_expected,
-                user=user
+                user=user,
+                force=True
             )
 
             last_name = ""
@@ -1134,7 +1150,8 @@ def process_restore_all_s3_files(user=None):
                     skipped_count,
                     failed_count,
                     total_expected=total_expected,
-                    user=user
+                    user=user,
+                    force=True
                 )
                 cleanup_memory()
 
@@ -1154,7 +1171,8 @@ def process_restore_all_s3_files(user=None):
                 skipped_count,
                 failed_count,
                 total_expected=total_expected,
-                user=user
+                user=user,
+                force=True
             )
 
             last_file_name = ""
@@ -1319,7 +1337,8 @@ def process_restore_all_s3_files(user=None):
                     skipped_count,
                     failed_count,
                     total_expected=total_expected,
-                    user=user
+                    user=user,
+                    force=True
                 )
                 cleanup_memory()
 

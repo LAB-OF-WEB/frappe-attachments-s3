@@ -3,20 +3,6 @@
 
 frappe.ui.form.on('S3 File Attachment', {
 	refresh: function(frm) {
-		frappe.realtime.off('s3_migration_progress');
-		frappe.realtime.on('s3_migration_progress', function(data) {
-			if (data && data.current_phase) {
-				frappe.show_alert({
-					message: __('S3 Progress ({0}%): {1} - {2}', [
-						data.progress_percentage || 0,
-						data.current_phase,
-						data.current_file || ''
-					]),
-					indicator: 'blue'
-				}, 4);
-			}
-		});
-
 		frappe.realtime.off('s3_migration_complete');
 		frappe.realtime.on('s3_migration_complete', function(data) {
 			frappe.msgprint(data.message || __('S3 Migration completed.'), __('S3 Migration'));
