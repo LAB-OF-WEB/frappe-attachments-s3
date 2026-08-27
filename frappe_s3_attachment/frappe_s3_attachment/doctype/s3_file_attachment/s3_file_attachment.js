@@ -37,10 +37,14 @@ frappe.ui.form.on('S3 File Attachment', {
 					freeze_message: __('Queueing background migration...'),
 					callback: function (r) {
 						if (r.message && r.message.status === 'enqueued') {
+							var doc_name = r.message.migration_doc;
+							var msg = doc_name
+								? __('File migration enqueued. Tracking in S3 Migration: {0}', ['<a href="/app/s3-migration/' + doc_name + '"><b>' + doc_name + '</b></a>'])
+								: __('File migration has been enqueued in the background.');
 							frappe.show_alert({
-								message: __('File migration has been enqueued in the background. You will be notified when complete.'),
+								message: msg,
 								indicator: 'green'
-							}, 7);
+							}, 10);
 						} else if (r.message && r.message.status === 'disabled') {
 							frappe.msgprint(r.message.message || __('S3 upload is currently disabled in settings.'));
 						} else {
@@ -61,10 +65,14 @@ frappe.ui.form.on('S3 File Attachment', {
 					freeze_message: __('Queueing background restore...'),
 					callback: function (r) {
 						if (r.message && r.message.status === 'enqueued') {
+							var doc_name = r.message.migration_doc;
+							var msg = doc_name
+								? __('File restore enqueued. Tracking in S3 Migration: {0}', ['<a href="/app/s3-migration/' + doc_name + '"><b>' + doc_name + '</b></a>'])
+								: __('File restore has been enqueued in the background.');
 							frappe.show_alert({
-								message: __('File restore has been enqueued in the background. You will be notified when complete.'),
+								message: msg,
 								indicator: 'green'
-							}, 7);
+							}, 10);
 						} else {
 							frappe.msgprint(__('Unable to queue restore job. Please check error logs.'));
 						}
@@ -193,10 +201,14 @@ function show_storage_scan_dialog(frm, scan_data) {
 				freeze_message: __('Queueing background storage cleanup...'),
 				callback: function (resp) {
 					if (resp.message && resp.message.status === 'enqueued') {
+						var doc_name = resp.message.migration_doc;
+						var msg = doc_name
+							? __('Storage reclamation enqueued. Tracking in S3 Migration: {0}', ['<a href="/app/s3-migration/' + doc_name + '"><b>' + doc_name + '</b></a>'])
+							: __('Storage reclamation has been enqueued in the background.');
 						frappe.show_alert({
-							message: __('Storage reclamation has been enqueued in the background. Check S3 Migration logs for live progress.'),
+							message: msg,
 							indicator: 'green'
-						}, 7);
+						}, 10);
 					} else {
 						frappe.msgprint(__('Unable to queue cleanup job.'));
 					}
@@ -230,10 +242,14 @@ function show_storage_scan_dialog(frm, scan_data) {
 			freeze_message: __('Queueing Disk storage cleanup...'),
 			callback: function (resp) {
 				if (resp.message && resp.message.status === 'enqueued') {
+					var doc_name = resp.message.migration_doc;
+					var msg = doc_name
+						? __('Disk reclamation enqueued. Tracking in S3 Migration: {0}', ['<a href="/app/s3-migration/' + doc_name + '"><b>' + doc_name + '</b></a>'])
+						: __('Disk storage reclamation has been enqueued in the background.');
 					frappe.show_alert({
-						message: __('Disk storage reclamation has been enqueued in the background.'),
+						message: msg,
 						indicator: 'green'
-					}, 7);
+					}, 10);
 				} else {
 					frappe.msgprint(__('Unable to queue disk cleanup job.'));
 				}
@@ -264,10 +280,14 @@ function show_storage_scan_dialog(frm, scan_data) {
 			freeze_message: __('Queueing S3 storage cleanup...'),
 			callback: function (resp) {
 				if (resp.message && resp.message.status === 'enqueued') {
+					var doc_name = resp.message.migration_doc;
+					var msg = doc_name
+						? __('S3 reclamation enqueued. Tracking in S3 Migration: {0}', ['<a href="/app/s3-migration/' + doc_name + '"><b>' + doc_name + '</b></a>'])
+						: __('S3 storage reclamation has been enqueued in the background.');
 					frappe.show_alert({
-						message: __('S3 storage reclamation has been enqueued in the background.'),
+						message: msg,
 						indicator: 'green'
-					}, 7);
+					}, 10);
 				} else {
 					frappe.msgprint(__('Unable to queue S3 cleanup job.'));
 				}

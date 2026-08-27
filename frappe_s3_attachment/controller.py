@@ -617,16 +617,32 @@ def migrate_existing_files():
             "message": frappe._("S3 upload is currently disabled in S3 File Attachment settings.")
         }
 
+    migration_doc_name = None
+    try:
+        migration_doc = frappe.new_doc("S3 Migration")
+        migration_doc.operation_type = "Migrate to S3"
+        migration_doc.status = "In Progress"
+        migration_doc.started_at = frappe.utils.now_datetime()
+        migration_doc.initiated_by = frappe.session.user
+        migration_doc.current_phase = "Queued in background..."
+        migration_doc.insert(ignore_permissions=True)
+        frappe.db.commit()
+        migration_doc_name = migration_doc.name
+    except Exception as e:
+        frappe.logger().warning("Could not pre-create S3 Migration log: {0}".format(str(e)))
+
     frappe.enqueue(
         "frappe_s3_attachment.controller.process_files_migration",
         queue="long",
         timeout=86400,
         is_async=True,
-        user=frappe.session.user
+        user=frappe.session.user,
+        migration_doc_name=migration_doc_name
     )
     return {
         "status": "enqueued",
-        "message": frappe._("File migration started in background.")
+        "migration_doc": migration_doc_name,
+        "message": frappe._("File migration enqueued in background.")
     }
 
 
@@ -648,22 +664,24 @@ def update_migration_progress(
 ):
     """
     Directly updates the S3 Migration document in the database with current status and heartbeat.
-    Commits immediately so that progress is visible in Desk and persisted even if the worker is killed.
-    Throttles Socket.IO and DB writes to at most once every min_interval_seconds to prevent event flooding.
+    Bypasses frappe.get_doc / save() to avoid concurrency TimestampMismatchError.
+    Throttled by default (min_interval_seconds) unless force=True.
+    Emits socket.io realtime events for live progress updates.
     """
     if not migration_doc_name:
         return
 
-    now_ts = time.time()
-    last_ts = _last_progress_update.get(migration_doc_name, 0)
-    if not force and (now_ts - last_ts < min_interval_seconds):
-        return
+    now = datetime.datetime.now()
+    if not force:
+        last_time = _last_progress_update.get(migration_doc_name)
+        if last_time and (now - last_time).total_seconds() < min_interval_seconds:
+            return
 
-    _last_progress_update[migration_doc_name] = now_ts
-    now = frappe.utils.now_datetime()
+    _last_progress_update[migration_doc_name] = now
+
     progress_pct = 0.0
     if total_expected and total_expected > 0:
-        progress_pct = min(100.0, round((total_scanned / total_expected) * 100.0, 1))
+        progress_pct = min(100.0, round((total_scanned / float(total_expected)) * 100.0, 1))
 
     try:
         frappe.db.sql(
@@ -681,22 +699,22 @@ def update_migration_progress(
             WHERE name = %s
             """,
             (
-                current_phase or "",
-                (current_file[:500] if current_file else ""),
+                (current_phase or "")[:140],
+                (current_file or "")[:140],
                 total_scanned,
                 successful,
                 skipped,
                 failed,
                 progress_pct,
-                now,
-                now,
+                frappe.utils.now_datetime(),
+                frappe.utils.now_datetime(),
                 migration_doc_name
             )
         )
         frappe.db.commit()
     except Exception as e:
         frappe.logger().warning(
-            "Could not update live migration progress for {0}: {1}".format(migration_doc_name, str(e))
+            "Could not update S3 Migration {0} progress: {1}".format(migration_doc_name, str(e))
         )
 
     # Emit socket.io realtime event for live UI update inside S3 Migration form
@@ -712,7 +730,7 @@ def update_migration_progress(
                 "skipped_files": skipped,
                 "failed_files": failed,
                 "progress_percentage": progress_pct,
-                "last_heartbeat": str(now)
+                "last_heartbeat": str(frappe.utils.now_datetime())
             },
             user=user
         )
@@ -720,7 +738,7 @@ def update_migration_progress(
         pass
 
 
-def process_files_migration(user=None):
+def process_files_migration(user=None, migration_doc_name=None):
     """
     Background worker to migrate existing files to s3 with S3 Migration audit logging.
     Optimized for high memory efficiency: processes in batches, clears document caches, and limits warning memory.
@@ -730,20 +748,19 @@ def process_files_migration(user=None):
     import traceback
 
     start_time = datetime.datetime.now()
-    migration_doc = None
-    migration_doc_name = None
-    try:
-        migration_doc = frappe.new_doc("S3 Migration")
-        migration_doc.operation_type = "Migrate to S3"
-        migration_doc.status = "In Progress"
-        migration_doc.started_at = frappe.utils.now_datetime()
-        migration_doc.initiated_by = user or frappe.session.user
-        migration_doc.current_phase = "Initializing migration..."
-        migration_doc.insert(ignore_permissions=True)
-        frappe.db.commit()
-        migration_doc_name = migration_doc.name
-    except Exception as e:
-        frappe.logger().warning("Could not initialize S3 Migration log: {0}".format(str(e)))
+    if not migration_doc_name:
+        try:
+            migration_doc = frappe.new_doc("S3 Migration")
+            migration_doc.operation_type = "Migrate to S3"
+            migration_doc.status = "In Progress"
+            migration_doc.started_at = frappe.utils.now_datetime()
+            migration_doc.initiated_by = user or frappe.session.user
+            migration_doc.current_phase = "Initializing migration..."
+            migration_doc.insert(ignore_permissions=True)
+            frappe.db.commit()
+            migration_doc_name = migration_doc.name
+        except Exception as e:
+            frappe.logger().warning("Could not initialize S3 Migration log: {0}".format(str(e)))
 
     site_path = frappe.utils.get_site_path()
     migrated_count = 0
@@ -1026,20 +1043,36 @@ def restore_all_s3_files():
     """
     Function to enqueue background job to restore all S3 files back to disk without deleting from S3.
     """
+    migration_doc_name = None
+    try:
+        migration_doc = frappe.new_doc("S3 Migration")
+        migration_doc.operation_type = "Restore from S3"
+        migration_doc.status = "In Progress"
+        migration_doc.started_at = frappe.utils.now_datetime()
+        migration_doc.initiated_by = frappe.session.user
+        migration_doc.current_phase = "Queued in background..."
+        migration_doc.insert(ignore_permissions=True)
+        frappe.db.commit()
+        migration_doc_name = migration_doc.name
+    except Exception as e:
+        frappe.logger().warning("Could not pre-create S3 Migration restore log: {0}".format(str(e)))
+
     frappe.enqueue(
         "frappe_s3_attachment.controller.process_restore_all_s3_files",
         queue="long",
         timeout=86400,
         is_async=True,
-        user=frappe.session.user
+        user=frappe.session.user,
+        migration_doc_name=migration_doc_name
     )
     return {
         "status": "enqueued",
-        "message": frappe._("File restoration from S3 started in background.")
+        "migration_doc": migration_doc_name,
+        "message": frappe._("File restoration from S3 enqueued in background.")
     }
 
 
-def process_restore_all_s3_files(user=None):
+def process_restore_all_s3_files(user=None, migration_doc_name=None):
     """
     Background worker to fetch all files from S3 back to local disk and revert database URLs with S3 Migration audit logging.
     Does NOT delete files from AWS S3.
@@ -1050,20 +1083,19 @@ def process_restore_all_s3_files(user=None):
     import traceback
 
     start_time = datetime.datetime.now()
-    migration_doc = None
-    migration_doc_name = None
-    try:
-        migration_doc = frappe.new_doc("S3 Migration")
-        migration_doc.operation_type = "Restore from S3"
-        migration_doc.status = "In Progress"
-        migration_doc.started_at = frappe.utils.now_datetime()
-        migration_doc.initiated_by = user or frappe.session.user
-        migration_doc.current_phase = "Initializing restore..."
-        migration_doc.insert(ignore_permissions=True)
-        frappe.db.commit()
-        migration_doc_name = migration_doc.name
-    except Exception as e:
-        frappe.logger().warning("Could not initialize S3 Migration restore log: {0}".format(str(e)))
+    if not migration_doc_name:
+        try:
+            migration_doc = frappe.new_doc("S3 Migration")
+            migration_doc.operation_type = "Restore from S3"
+            migration_doc.status = "In Progress"
+            migration_doc.started_at = frappe.utils.now_datetime()
+            migration_doc.initiated_by = user or frappe.session.user
+            migration_doc.current_phase = "Initializing restore..."
+            migration_doc.insert(ignore_permissions=True)
+            frappe.db.commit()
+            migration_doc_name = migration_doc.name
+        except Exception as e:
+            frappe.logger().warning("Could not initialize S3 Migration restore log: {0}".format(str(e)))
 
     site_path = frappe.utils.get_site_path()
     s3_ops = S3Operations()
@@ -1801,7 +1833,7 @@ def get_cached_scan_result():
 @frappe.whitelist()
 def reclaim_storage_space(target="all", categories=None, grace_period_days=7):
     """
-    Enqueues a background worker to reclaim storage space.
+    Enqueues a background worker to reclaim storage space with immediate S3 Migration log creation.
     :param target: "disk", "s3", or "all".
     :param categories: specific list of categories to clean.
     """
@@ -1817,7 +1849,23 @@ def reclaim_storage_space(target="all", categories=None, grace_period_days=7):
     except (ValueError, TypeError):
         grace_period_days = 7
 
+    target = target or "all"
     target_label = "Disk and S3" if target == "all" else ("Disk" if target == "disk" else "S3 Cloud")
+
+    migration_doc_name = None
+    try:
+        migration_doc = frappe.new_doc("S3 Migration")
+        migration_doc.operation_type = "Cleanup Storage"
+        migration_doc.status = "In Progress"
+        migration_doc.started_at = frappe.utils.now_datetime()
+        migration_doc.initiated_by = frappe.session.user
+        migration_doc.current_phase = "Queued for {0} storage reclamation...".format(target_label)
+        migration_doc.insert(ignore_permissions=True)
+        frappe.db.commit()
+        migration_doc_name = migration_doc.name
+    except Exception as e:
+        frappe.logger().warning("Could not pre-create S3 Migration cleanup log: {0}".format(str(e)))
+
     frappe.enqueue(
         "frappe_s3_attachment.controller.process_storage_cleanup",
         queue="long",
@@ -1826,15 +1874,17 @@ def reclaim_storage_space(target="all", categories=None, grace_period_days=7):
         target=target,
         categories=categories,
         grace_period_days=grace_period_days,
-        user=frappe.session.user
+        user=frappe.session.user,
+        migration_doc_name=migration_doc_name
     )
     return {
         "status": "enqueued",
+        "migration_doc": migration_doc_name,
         "message": frappe._("{0} storage space reclamation has been enqueued in the background.").format(target_label)
     }
 
 
-def process_storage_cleanup(target="all", categories=None, grace_period_days=7, user=None):
+def process_storage_cleanup(target="all", categories=None, grace_period_days=7, user=None, migration_doc_name=None):
     """
     Background worker to execute storage cleanup across:
     Disk: duplicate_local_files, orphaned_disk_attachments, unlinked_disk_files, unreferenced_disk_files
@@ -1856,19 +1906,19 @@ def process_storage_cleanup(target="all", categories=None, grace_period_days=7, 
             ]
 
     start_time = datetime.datetime.now()
-    migration_doc_name = None
-    try:
-        migration_doc = frappe.new_doc("S3 Migration")
-        migration_doc.operation_type = "Cleanup Storage"
-        migration_doc.status = "In Progress"
-        migration_doc.started_at = frappe.utils.now_datetime()
-        migration_doc.initiated_by = user or frappe.session.user
-        migration_doc.current_phase = "Initializing storage reclamation ({0})...".format(target)
-        migration_doc.insert(ignore_permissions=True)
-        frappe.db.commit()
-        migration_doc_name = migration_doc.name
-    except Exception as e:
-        frappe.logger().warning("Could not initialize S3 Migration cleanup log: {0}".format(str(e)))
+    if not migration_doc_name:
+        try:
+            migration_doc = frappe.new_doc("S3 Migration")
+            migration_doc.operation_type = "Cleanup Storage"
+            migration_doc.status = "In Progress"
+            migration_doc.started_at = frappe.utils.now_datetime()
+            migration_doc.initiated_by = user or frappe.session.user
+            migration_doc.current_phase = "Initializing storage reclamation ({0})...".format(target)
+            migration_doc.insert(ignore_permissions=True)
+            frappe.db.commit()
+            migration_doc_name = migration_doc.name
+        except Exception as e:
+            frappe.logger().warning("Could not initialize S3 Migration cleanup log: {0}".format(str(e)))
 
     site_path = frappe.utils.get_site_path()
     s3_ops = S3Operations()
