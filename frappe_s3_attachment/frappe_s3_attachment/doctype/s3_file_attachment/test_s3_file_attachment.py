@@ -445,3 +445,74 @@ class TestS3FileAttachment(unittest.TestCase):
             # S3 File record should still be created for tracking
             mock_new_doc.assert_called_with("S3 File")
 
+    @patch("os.path.exists")
+    @patch("os.path.getsize", return_value=1024)
+    @patch("frappe.get_all")
+    @patch("frappe.db.sql")
+    @patch("frappe.db.exists")
+    def test_scan_storage_space(self, mock_exists_db, mock_sql, mock_get_all, mock_getsize, mock_exists_fs):
+        from frappe_s3_attachment.controller import scan_storage_space
+        frappe.utils.get_site_path.return_value = "/sites/mysite"
+        mock_exists_fs.return_value = True
+
+        # S3 Files (Duplicate local files)
+        mock_get_all.return_value = [
+            {"name": "S3F-001", "original_file_url": "/files/test1.pdf", "is_private": 0, "file_name": "test1.pdf"}
+        ]
+        # sql side effect for tabFile s3 urls, attached files, unlinked files, unreferenced files
+        mock_sql.side_effect = [
+            [], # tabFile with S3 url
+            [{"name": "FILE-002", "file_name": "orphan.png", "file_url": "/files/orphan.png", "file_size": 2048, "attached_to_doctype": "Item", "attached_to_name": "DELETED-ITEM", "is_private": 0}], # attached files
+            [{"name": "FILE-003", "file_name": "unlinked.pdf", "file_url": "/files/unlinked.pdf", "file_size": 4096, "is_private": 0}], # unlinked files
+            [{"file_url": "/files/test1.pdf"}], # db file urls
+            [{"original_file_url": "/files/test1.pdf"}], # s3 orig urls
+            [], # s3 keys
+            []  # content hashes
+        ]
+        mock_exists_db.return_value = False # Item does not exist -> orphan!
+
+        with patch("frappe_s3_attachment.controller.S3Operations") as mock_s3_ops_cls:
+            s3_inst = MagicMock()
+            s3_inst.S3_CLIENT = None
+            mock_s3_ops_cls.return_value = s3_inst
+
+            res = scan_storage_space(grace_period_days=7)
+            self.assertEqual(res["status"], "success")
+            self.assertGreater(res["summary"]["total_files"], 0)
+            self.assertEqual(res["summary"]["duplicate_local_files"]["count"], 1)
+            self.assertEqual(res["summary"]["orphaned_attachments"]["count"], 1)
+            self.assertEqual(res["summary"]["unlinked_files"]["count"], 1)
+
+    @patch("os.remove")
+    @patch("os.path.exists", return_value=True)
+    @patch("os.path.getsize", return_value=1024)
+    @patch("frappe.get_all")
+    @patch("frappe.db.sql")
+    @patch("frappe.new_doc")
+    def test_process_storage_cleanup_duplicate_local_files(
+        self, mock_new_doc, mock_sql, mock_get_all, mock_getsize, mock_exists, mock_remove
+    ):
+        from frappe_s3_attachment.controller import process_storage_cleanup
+        frappe.utils.get_site_path.return_value = "/sites/mysite"
+
+        mock_mig_doc = MagicMock()
+        mock_mig_doc.name = "S3MIG-001"
+        mock_new_doc.return_value = mock_mig_doc
+
+        mock_get_all.return_value = [
+            {"name": "S3F-001", "s3_key": "2026/08/test.pdf", "original_file_url": "/files/test.pdf", "is_private": 0, "file_name": "test.pdf"}
+        ]
+
+        with patch("frappe_s3_attachment.controller.S3Operations") as mock_s3_ops_cls:
+            s3_inst = MagicMock()
+            s3_inst.verify_s3_object_exists.return_value = True
+            mock_s3_ops_cls.return_value = s3_inst
+
+            process_storage_cleanup(categories=["duplicate_local_files"])
+
+            # Local disk file must be deleted because S3 object is verified!
+            mock_remove.assert_called_once()
+            # Direct SQL update should have finalized status as Completed
+            mock_sql.assert_called()
+
+
