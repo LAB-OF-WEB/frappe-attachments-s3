@@ -92,58 +92,6 @@ frappe.ui.form.on('S3 File Attachment', {
 				}
 			}
 		});
-	},
-	reclaim_disk_storage: function (frm) {
-		frappe.confirm(
-			__('Are you sure you want to reclaim storage from local server disk in the background?'),
-			function () {
-				frappe.call({
-					method: 'frappe_s3_attachment.controller.reclaim_storage_space',
-					args: {
-						target: 'disk',
-						grace_period_days: frm.doc.unlinked_grace_period_days || 7
-					},
-					freeze: true,
-					freeze_message: __('Queueing Disk storage cleanup...'),
-					callback: function (resp) {
-						if (resp.message && resp.message.status === 'enqueued') {
-							frappe.show_alert({
-								message: __('Disk storage reclamation has been enqueued in the background.'),
-								indicator: 'green'
-							}, 7);
-						} else {
-							frappe.msgprint(__('Unable to queue disk cleanup job.'));
-						}
-					}
-				});
-			}
-		);
-	},
-	reclaim_s3_storage: function (frm) {
-		frappe.confirm(
-			__('Are you sure you want to reclaim storage from AWS S3 cloud bucket in the background?'),
-			function () {
-				frappe.call({
-					method: 'frappe_s3_attachment.controller.reclaim_storage_space',
-					args: {
-						target: 's3',
-						grace_period_days: frm.doc.unlinked_grace_period_days || 7
-					},
-					freeze: true,
-					freeze_message: __('Queueing S3 storage cleanup...'),
-					callback: function (resp) {
-						if (resp.message && resp.message.status === 'enqueued') {
-							frappe.show_alert({
-								message: __('S3 storage reclamation has been enqueued in the background.'),
-								indicator: 'green'
-							}, 7);
-						} else {
-							frappe.msgprint(__('Unable to queue S3 cleanup job.'));
-						}
-					}
-				});
-			}
-		);
 	}
 });
 
@@ -257,7 +205,7 @@ function show_storage_scan_dialog(frm, scan_data) {
 		}
 	});
 
-	d.set_secondary_action_label(__('Reclaim Disk Storage'));
+	d.set_secondary_action_label(__('Reclaim Selected Disk Items'));
 	d.set_secondary_action(function () {
 		var vals = d.get_values();
 		var selected = [];
@@ -267,7 +215,8 @@ function show_storage_scan_dialog(frm, scan_data) {
 		if (vals.unreferenced_disk_files) selected.push('unreferenced_disk_files');
 
 		if (selected.length === 0) {
-			selected = ['duplicate_local_files', 'orphaned_disk_attachments', 'unlinked_disk_files', 'unreferenced_disk_files'];
+			frappe.msgprint(__('Please select at least one disk category to reclaim.'));
+			return;
 		}
 		d.hide();
 		frappe.call({
@@ -287,6 +236,40 @@ function show_storage_scan_dialog(frm, scan_data) {
 					}, 7);
 				} else {
 					frappe.msgprint(__('Unable to queue disk cleanup job.'));
+				}
+			}
+		});
+	});
+
+	d.add_custom_action(__('Reclaim Selected S3 Items'), function () {
+		var vals = d.get_values();
+		var selected = [];
+		if (vals.orphaned_s3_attachments) selected.push('orphaned_s3_attachments');
+		if (vals.unlinked_s3_files) selected.push('unlinked_s3_files');
+		if (vals.unreferenced_s3_objects) selected.push('unreferenced_s3_objects');
+
+		if (selected.length === 0) {
+			frappe.msgprint(__('Please select at least one S3 category to reclaim.'));
+			return;
+		}
+		d.hide();
+		frappe.call({
+			method: 'frappe_s3_attachment.controller.reclaim_storage_space',
+			args: {
+				target: 's3',
+				categories: selected,
+				grace_period_days: frm.doc.unlinked_grace_period_days || 7
+			},
+			freeze: true,
+			freeze_message: __('Queueing S3 storage cleanup...'),
+			callback: function (resp) {
+				if (resp.message && resp.message.status === 'enqueued') {
+					frappe.show_alert({
+						message: __('S3 storage reclamation has been enqueued in the background.'),
+						indicator: 'green'
+					}, 7);
+				} else {
+					frappe.msgprint(__('Unable to queue S3 cleanup job.'));
 				}
 			}
 		});
