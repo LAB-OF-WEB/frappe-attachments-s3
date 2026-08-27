@@ -104,7 +104,7 @@ frappe.ui.form.on('S3 File Attachment', {
 						grace_period_days: frm.doc.unlinked_grace_period_days || 7
 					},
 					freeze: true,
-					freeze_message: __('Queueing Part 1 (Disk) storage cleanup...'),
+					freeze_message: __('Queueing Disk storage cleanup...'),
 					callback: function (resp) {
 						if (resp.message && resp.message.status === 'enqueued') {
 							frappe.show_alert({
@@ -130,7 +130,7 @@ frappe.ui.form.on('S3 File Attachment', {
 						grace_period_days: frm.doc.unlinked_grace_period_days || 7
 					},
 					freeze: true,
-					freeze_message: __('Queueing Part 2 (S3) storage cleanup...'),
+					freeze_message: __('Queueing S3 storage cleanup...'),
 					callback: function (resp) {
 						if (resp.message && resp.message.status === 'enqueued') {
 							frappe.show_alert({
@@ -161,13 +161,13 @@ function show_storage_scan_dialog(frm, scan_data) {
 				fieldtype: 'HTML',
 				options: '<div class="alert alert-info" style="margin-bottom:15px;">' +
 					'<b>' + __('Total Space Reclaimable:') + ' ' + total_mb + ' MB</b> (' + total_files + ' ' + __('files/objects') + ')<br>' +
-					'<b>' + __('Part 1 (Local Disk):') + ' ' + disk.total_mb + ' MB</b> | <b>' + __('Part 2 (S3 Cloud):') + ' ' + s3.total_mb + ' MB</b>' +
+					'<b>' + __('Local Disk:') + ' ' + disk.total_mb + ' MB</b> | <b>' + __('S3 Cloud:') + ' ' + s3.total_mb + ' MB</b>' +
 					'</div>'
 			},
 			{
 				fieldname: 'sec_disk',
 				fieldtype: 'Section Break',
-				label: __('Part 1: Local Disk Storage Reclamation ({0} MB)', [disk.total_mb])
+				label: __('Local Disk Storage Reclamation ({0} MB)', [disk.total_mb])
 			},
 			{
 				fieldname: 'duplicate_local_files',
@@ -196,7 +196,7 @@ function show_storage_scan_dialog(frm, scan_data) {
 			{
 				fieldname: 'sec_s3',
 				fieldtype: 'Section Break',
-				label: __('Part 2: AWS S3 Cloud Storage Reclamation ({0} MB)', [s3.total_mb])
+				label: __('AWS S3 Cloud Storage Reclamation ({0} MB)', [s3.total_mb])
 			},
 			{
 				fieldname: 'orphaned_s3_attachments',
@@ -257,7 +257,7 @@ function show_storage_scan_dialog(frm, scan_data) {
 		}
 	});
 
-	d.set_secondary_action_label(__('Reclaim Disk Only (Part 1)'));
+	d.set_secondary_action_label(__('Reclaim Disk Storage'));
 	d.set_secondary_action(function () {
 		var vals = d.get_values();
 		var selected = [];
@@ -278,7 +278,7 @@ function show_storage_scan_dialog(frm, scan_data) {
 				grace_period_days: frm.doc.unlinked_grace_period_days || 7
 			},
 			freeze: true,
-			freeze_message: __('Queueing Part 1 (Disk) storage cleanup...'),
+			freeze_message: __('Queueing Disk storage cleanup...'),
 			callback: function (resp) {
 				if (resp.message && resp.message.status === 'enqueued') {
 					frappe.show_alert({
