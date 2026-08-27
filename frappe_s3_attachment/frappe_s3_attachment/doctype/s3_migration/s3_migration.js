@@ -53,6 +53,13 @@ frappe.ui.form.on('S3 Migration', {
 			}
 		});
 
+		frappe.realtime.off('s3_cleanup_complete');
+		frappe.realtime.on('s3_cleanup_complete', function(data) {
+			if (!data.migration_doc || data.migration_doc === frm.doc.name) {
+				frm.reload_doc();
+			}
+		});
+
 		if (frm.doc.status === 'In Progress') {
 			frm.dashboard.set_headline(
 				__('Job is running ({0}%): {1} - {2}', [
