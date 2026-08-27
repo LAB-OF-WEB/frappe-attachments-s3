@@ -1721,7 +1721,7 @@ def scan_storage_space(grace_period_days=7):
     total_bytes = disk_summary["total_bytes"] + s3_summary["total_bytes"]
     total_mb = round(total_bytes / (1024.0 * 1024.0), 2)
 
-    return {
+    res = {
         "status": "success",
         "disk_summary": disk_summary,
         "s3_summary": s3_summary,
@@ -1729,6 +1729,73 @@ def scan_storage_space(grace_period_days=7):
         "total_bytes": total_bytes,
         "total_mb": total_mb
     }
+
+    try:
+        frappe.cache().set_value("s3_storage_scan_result", res, expires_in_sec=3600)
+    except Exception:
+        pass
+
+    return res
+
+
+@frappe.whitelist()
+def enqueue_scan_storage_space(grace_period_days=7):
+    """
+    Enqueues storage space scanning in background RQ queue to prevent HTTP 502 gateway timeouts.
+    Emits 's3_storage_scan_complete' via realtime socket.io when finished.
+    """
+    try:
+        grace_period_days = int(grace_period_days or 7)
+    except (ValueError, TypeError):
+        grace_period_days = 7
+
+    frappe.enqueue(
+        "frappe_s3_attachment.controller.process_scan_storage_space",
+        queue="default",
+        timeout=1800,
+        is_async=True,
+        grace_period_days=grace_period_days,
+        user=frappe.session.user
+    )
+    return {
+        "status": "enqueued",
+        "message": frappe._("Storage scan enqueued in background.")
+    }
+
+
+def process_scan_storage_space(grace_period_days=7, user=None):
+    """
+    Background worker to scan storage space and notify user via socket.io.
+    """
+    try:
+        res = scan_storage_space(grace_period_days=grace_period_days)
+        frappe.publish_realtime(
+            "s3_storage_scan_complete",
+            res,
+            user=user or frappe.session.user
+        )
+    except Exception as e:
+        frappe.logger().error("Error during process_scan_storage_space: {0}".format(str(e)))
+        frappe.publish_realtime(
+            "s3_storage_scan_complete",
+            {
+                "status": "error",
+                "message": str(e)
+            },
+            user=user or frappe.session.user
+        )
+
+
+@frappe.whitelist()
+def get_cached_scan_result():
+    """
+    Returns the latest cached scan result if available.
+    """
+    try:
+        return frappe.cache().get_value("s3_storage_scan_result")
+    except Exception:
+        return None
+
 
 
 @frappe.whitelist()
