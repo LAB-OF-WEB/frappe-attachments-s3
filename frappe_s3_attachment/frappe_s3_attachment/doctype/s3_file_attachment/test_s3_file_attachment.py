@@ -478,10 +478,10 @@ class TestS3FileAttachment(unittest.TestCase):
 
             res = scan_storage_space(grace_period_days=7)
             self.assertEqual(res["status"], "success")
-            self.assertGreater(res["summary"]["total_files"], 0)
-            self.assertEqual(res["summary"]["duplicate_local_files"]["count"], 1)
-            self.assertEqual(res["summary"]["orphaned_attachments"]["count"], 1)
-            self.assertEqual(res["summary"]["unlinked_files"]["count"], 1)
+            self.assertGreater(res["total_files"], 0)
+            self.assertEqual(res["disk_summary"]["duplicate_local_files"]["count"], 1)
+            self.assertEqual(res["disk_summary"]["orphaned_disk_attachments"]["count"], 1)
+            self.assertEqual(res["disk_summary"]["unlinked_disk_files"]["count"], 1)
 
     @patch("os.remove")
     @patch("os.path.exists", return_value=True)
@@ -508,11 +508,12 @@ class TestS3FileAttachment(unittest.TestCase):
             s3_inst.verify_s3_object_exists.return_value = True
             mock_s3_ops_cls.return_value = s3_inst
 
-            process_storage_cleanup(categories=["duplicate_local_files"])
+            process_storage_cleanup(target="disk", categories=["duplicate_local_files"])
 
             # Local disk file must be deleted because S3 object is verified!
             mock_remove.assert_called_once()
             # Direct SQL update should have finalized status as Completed
             mock_sql.assert_called()
+
 
 
