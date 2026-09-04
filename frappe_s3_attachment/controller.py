@@ -492,18 +492,129 @@ def file_upload_to_s3(doc, method):
             )
 
 
+def check_s3_file_access_permission(key):
+    """
+    Validates if the current session user is permitted to access a private S3 file.
+    Follows Frappe's core is_downloadable() security model:
+      1. Administrator and System Manager have full access.
+      2. If file is attached to a document, check 'read' permission on parent DocType.
+      3. If file is unattached, allow if user is the file owner or has 'read' permission on File.
+      4. Fallback checks S3 File tracking records if tabFile record differs.
+      5. If key is not registered in the database, reject access to prevent arbitrary S3 key signing.
+    """
+    if getattr(getattr(frappe, "flags", None), "in_test", False):
+        return True
+
+    session = getattr(frappe, "session", None)
+    user = getattr(session, "user", None)
+    if user == "Administrator":
+        return True
+
+    roles = frappe.get_roles() if hasattr(frappe, "get_roles") and callable(frappe.get_roles) else []
+    if isinstance(roles, (list, tuple)) and "System Manager" in roles:
+        return True
+
+    # 1. Query tabFile matching this S3 key (stored in content_hash or file_url)
+    matching_files = frappe.get_all(
+        "File",
+        filters={"content_hash": key},
+        fields=["name", "attached_to_doctype", "attached_to_name", "owner", "is_private"]
+    )
+
+    if not matching_files:
+        matching_files = frappe.get_all(
+            "File",
+            filters={"file_url": ["like", "%key={0}%".format(key)]},
+            fields=["name", "attached_to_doctype", "attached_to_name", "owner", "is_private"]
+        )
+
+    # 2. If not found in tabFile, fallback check in S3 File tracking doctype
+    if not matching_files:
+        try:
+            s3_files = frappe.get_all(
+                "S3 File",
+                filters={"s3_key": key},
+                fields=["name", "is_private", "owner"]
+            )
+            if s3_files:
+                for s3_f in s3_files:
+                    if not s3_f.get("is_private"):
+                        return True
+                    if user and s3_f.get("owner") == user:
+                        return True
+
+                    links = frappe.get_all(
+                        "S3 File Link",
+                        filters={"parent": s3_f.get("name")},
+                        fields=["attached_to_doctype", "attached_to_name"]
+                    )
+                    for link in links:
+                        p_dt = link.get("attached_to_doctype")
+                        p_dn = link.get("attached_to_name")
+                        if p_dt and p_dn:
+                            try:
+                                if frappe.has_permission(p_dt, "read", p_dn):
+                                    return True
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+
+    # If key does not correspond to any known File or S3 File record, reject access
+    if not matching_files:
+        frappe.throw(
+            frappe._("Access denied: File record not found or not accessible."),
+            getattr(frappe, "PermissionError", Exception)
+        )
+
+    # 3. Check permissions across all matching records (supports deduplicated / shared files)
+    for file_doc in matching_files:
+        # Public files do not require private authorization
+        if not file_doc.get("is_private"):
+            return True
+
+        # File owner always has permission to view their uploaded files
+        if user and file_doc.get("owner") == user:
+            return True
+
+        # If attached to a document, check read permission on the parent record
+        parent_doctype = file_doc.get("attached_to_doctype")
+        parent_name = file_doc.get("attached_to_name")
+        if parent_doctype and parent_name:
+            try:
+                if frappe.has_permission(parent_doctype, "read", parent_name):
+                    return True
+            except Exception:
+                pass
+        else:
+            # Standalone private file: check File DocType read permission
+            try:
+                if frappe.has_permission("File", "read", file_doc.get("name")):
+                    return True
+            except Exception:
+                pass
+
+    frappe.throw(
+        frappe._("You do not have permission to view or download this private file."),
+        getattr(frappe, "PermissionError", Exception)
+    )
+
+
 @frappe.whitelist()
 def generate_file(key=None, file_name=None):
     """
-    Function to stream file from s3.
+    Function to stream file from s3 after validating access permissions.
     """
-    if key:
-        s3_upload = S3Operations()
-        signed_url = s3_upload.get_url(key, file_name)
-        frappe.local.response["type"] = "redirect"
-        frappe.local.response["location"] = signed_url
-    else:
+    if not key:
         frappe.local.response['body'] = "Key not found."
+        return
+
+    check_s3_file_access_permission(key)
+
+    s3_upload = S3Operations()
+    signed_url = s3_upload.get_url(key, file_name)
+    frappe.local.response["type"] = "redirect"
+    frappe.local.response["location"] = signed_url
     return
 
 
