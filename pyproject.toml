@@ -5,9 +5,18 @@ description = "A frappe app to upload file attachments in doctypes to s3."
 readme = "README.md"
 requires-python = ">=3.8"
 authors = [
-    {name = "LAB-OF-WEB"},
+    {name = "LAB-OF-WEB", email = "adishmuhammedmm@gmail.com"},
+    {name = "Zerodha Technology Pvt. Ltd.", email = "ramesh.ravi@zerodha.com"},
+]
+maintainers = [
+    {name = "LAB-OF-WEB", email = "adishmuhammedmm@gmail.com"},
 ]
 license = {text = "MIT"}
+
+[project.urls]
+Homepage = "https://github.com/LAB-OF-WEB/frappe-attachments-s3"
+Repository = "https://github.com/LAB-OF-WEB/frappe-attachments-s3.git"
+"Upstream Repository" = "https://github.com/zerodha/frappe-attachments-s3"
 
 dependencies = [
     "python-magic==0.4.18",

@@ -4,11 +4,11 @@ from . import __version__ as app_version
 
 app_name = "frappe_s3_attachment"
 app_title = "Frappe S3 Attachment"
-app_publisher = "Frappe"
+app_publisher = "LAB-OF-WEB"
 app_description = "Frappe app to make file upload to S3 through attach file option."
 app_icon = "octicon octicon-file-directory"
 app_color = "grey"
-app_email = "ramesh.ravi@zerodha.com"
+app_email = "adishmuhammedmm@gmail.com"
 app_license = "MIT"
 
 # Includes in <head>
@@ -27,9 +27,7 @@ app_license = "MIT"
 
 # include js in doctype views
 # doctype_js = {"doctype" : "public/js/doctype.js"}
-doctype_list_js = {
-    "S3 Attachment Settings": ["frappe_s3_attachment/doctype/s3_attachment_settings/s3_attachment_settings.js"]
-}
+# doctype_list_js = {"doctype" : "public/js/doctype_list.js"}
 # doctype_tree_js = {"doctype" : "public/js/doctype_tree.js"}
 # doctype_calendar_js = {"doctype" : "public/js/doctype_calendar.js"}
 

@@ -74,6 +74,15 @@ class S3Operations(object):
             'S3 File Attachment',
             'S3 File Attachment',
         )
+        endpoint_url = getattr(self.s3_settings_doc, 'endpoint_url', None)
+        if endpoint_url and isinstance(endpoint_url, str):
+            endpoint_url = endpoint_url.strip().rstrip('/') or None
+        elif not isinstance(endpoint_url, str) and endpoint_url:
+            endpoint_url = endpoint_url
+        else:
+            endpoint_url = None
+        self.endpoint_url = endpoint_url
+
         if (
             self.s3_settings_doc.aws_key and
             self.s3_settings_doc.aws_secret
@@ -83,12 +92,14 @@ class S3Operations(object):
                 aws_access_key_id=self.s3_settings_doc.aws_key,
                 aws_secret_access_key=self.s3_settings_doc.aws_secret,
                 region_name=self.s3_settings_doc.region_name,
+                endpoint_url=self.endpoint_url,
                 config=Config(signature_version='s3v4')
             )
         else:
             self.S3_CLIENT = boto3.client(
                 's3',
                 region_name=self.s3_settings_doc.region_name,
+                endpoint_url=self.endpoint_url,
                 config=Config(signature_version='s3v4')
             )
         self.BUCKET = self.s3_settings_doc.bucket_name
@@ -343,8 +354,9 @@ def update_all_matching_file_records(original_path, is_private, key, s3_upload, 
             method = "frappe_s3_attachment.controller.generate_file"
             s3_file_url = """/api/method/{0}?key={1}&file_name={2}""".format(method, key, f_name)
         else:
+            endpoint = (s3_upload.S3_CLIENT.meta.endpoint_url or '').rstrip('/')
             s3_file_url = '{}/{}/{}'.format(
-                s3_upload.S3_CLIENT.meta.endpoint_url,
+                endpoint,
                 s3_upload.BUCKET,
                 key
             )
@@ -472,8 +484,9 @@ def file_upload_to_s3(doc, method):
                 method_path = "frappe_s3_attachment.controller.generate_file"
                 doc.file_url = """/api/method/{0}?key={1}&file_name={2}""".format(method_path, key, doc.file_name)
             else:
+                endpoint = (s3_upload.S3_CLIENT.meta.endpoint_url or '').rstrip('/')
                 doc.file_url = '{}/{}/{}'.format(
-                    s3_upload.S3_CLIENT.meta.endpoint_url,
+                    endpoint,
                     s3_upload.BUCKET,
                     key
                 )

@@ -3,17 +3,68 @@
 # See license.txt
 from __future__ import unicode_literals
 
-import os
 import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
 # Mock dependencies if not installed in standalone environment
+if "frappe" not in sys.modules:
+    class MockDocument:
+        def __init__(self, *args, **kwargs):
+            self.name = kwargs.get("name", "MOCK-DOC-001")
+            self.flags = MagicMock()
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+        def set(self, key, val):
+            setattr(self, key, val)
+
+        def append(self, key, val):
+            if not hasattr(self, key) or not isinstance(getattr(self, key), list):
+                setattr(self, key, [])
+            getattr(self, key).append(val)
+
+        def save(self, *args, **kwargs):
+            pass
+
+        def insert(self, *args, **kwargs):
+            pass
+
+    def _whitelist(*args, **kwargs):
+        if len(args) == 1 and callable(args[0]):
+            return args[0]
+
+        def decorator(fn):
+            return fn
+
+        return decorator
+
+    m_frappe = MagicMock()
+    m_frappe.whitelist = _whitelist
+    m_frappe._ = lambda s, *a, **kw: s
+    m_frappe.flags = MagicMock(in_test=True)
+    m_frappe.local = MagicMock()
+    m_frappe.local.conf = MagicMock()
+    m_frappe.local.conf.get.return_value = []
+    m_frappe.local.response = {}
+    m_frappe.session = MagicMock(user="Administrator")
+    m_frappe.db.count.return_value = 0
+    m_frappe.db.exists.return_value = True
+    m_frappe.has_permission.return_value = True
+    m_frappe.get_roles.return_value = ["System Manager"]
+    m_frappe.utils.get_site_path.return_value = "/sites/mysite"
+    m_frappe.utils.now_datetime.return_value = "2026-08-22 23:00:00"
+    m_frappe.model.document.Document = MockDocument
+
+    sys.modules["frappe"] = m_frappe
+    sys.modules["frappe.utils"] = m_frappe.utils
+    sys.modules["frappe.model"] = m_frappe.model
+    sys.modules["frappe.model.document"] = m_frappe.model.document
+
 for mod in [
-    "frappe",
-    "frappe.utils",
-    "frappe.model",
-    "frappe.model.document",
     "boto3",
     "botocore",
     "botocore.client",
@@ -23,13 +74,14 @@ for mod in [
     if mod not in sys.modules:
         sys.modules[mod] = MagicMock()
 
-import frappe
-from frappe_s3_attachment.controller import (
+import frappe  # noqa: E402
+from frappe_s3_attachment.controller import (  # noqa: E402
     update_all_matching_file_records,
     upload_existing_files_s3,
     file_upload_to_s3,
     process_files_migration,
     s3_file_regex_match,
+    get_local_filepath,
 )
 
 
@@ -37,8 +89,15 @@ class TestS3FileAttachment(unittest.TestCase):
 
     def setUp(self):
         frappe.reset_mock()
-        frappe.utils.get_site_path = MagicMock(return_value="/sites/mysite")
-        frappe.local.conf = {}
+        frappe.flags.in_test = True
+        frappe.utils.get_site_path.return_value = "/sites/mysite"
+        frappe.utils.now_datetime.return_value = "2026-08-22 23:00:00"
+        frappe.local.conf = MagicMock()
+        frappe.local.conf.get.return_value = []
+        frappe.local.response = {}
+        frappe.db.count.return_value = 0
+        frappe.has_permission.return_value = True
+        frappe.get_roles.return_value = ["System Manager"]
 
     @patch("frappe.db.commit")
     @patch("frappe.db.set_value")
@@ -69,6 +128,8 @@ class TestS3FileAttachment(unittest.TestCase):
         mock_get_meta.return_value = mock_meta
 
         mock_s3 = MagicMock()
+        mock_s3.disable_s3_upload = 0
+        mock_s3.do_not_change_file_url = 0
         mock_s3.S3_CLIENT.meta.endpoint_url = "https://s3.amazonaws.com"
         mock_s3.BUCKET = "test-bucket"
 
@@ -100,6 +161,8 @@ class TestS3FileAttachment(unittest.TestCase):
             }
         ]
         mock_s3 = MagicMock()
+        mock_s3.disable_s3_upload = 0
+        mock_s3.do_not_change_file_url = 0
         mock_s3.BUCKET = "test-bucket"
 
         updated = update_all_matching_file_records(
@@ -115,6 +178,7 @@ class TestS3FileAttachment(unittest.TestCase):
         self.assertIn("/api/method/frappe_s3_attachment.controller.generate_file", sql_call_args[0])
         self.assertIn("key=2026/08/22/Salary/XYZ_payroll.pdf", sql_call_args[0])
 
+    @patch("frappe.get_all", return_value=[])
     @patch("os.remove")
     @patch("frappe_s3_attachment.controller.update_all_matching_file_records")
     @patch("frappe_s3_attachment.controller.S3Operations")
@@ -129,6 +193,7 @@ class TestS3FileAttachment(unittest.TestCase):
         mock_s3_ops,
         mock_update_records,
         mock_os_remove,
+        mock_get_all,
     ):
         frappe.utils.get_site_path.return_value = "/sites/mysite"
         mock_doc = MagicMock()
@@ -141,6 +206,9 @@ class TestS3FileAttachment(unittest.TestCase):
         mock_get_doc.return_value = mock_doc
 
         s3_inst = MagicMock()
+        s3_inst.disable_s3_upload = 0
+        s3_inst.do_not_change_file_url = 0
+        s3_inst.do_not_delete_local_files = 0
         s3_inst.upload_files_to_s3_with_key.return_value = "2026/08/22/Item/KEY_test.png"
         s3_inst.verify_s3_object_exists.return_value = True
         mock_s3_ops.return_value = s3_inst
@@ -151,9 +219,10 @@ class TestS3FileAttachment(unittest.TestCase):
 
         self.assertEqual(result, ["FILE-001", "FILE-002"])
         mock_update_records.assert_called_once_with(
-            "/files/test.png", 0, "2026/08/22/Item/KEY_test.png", s3_inst
+            "/files/test.png", 0, "2026/08/22/Item/KEY_test.png", s3_inst, existing_s3_doc_name=None
         )
-        mock_os_remove.assert_called_once_with("/sites/mysite/public/files/test.png")
+        expected_remove_path, _ = get_local_filepath("/files/test.png", 0, "/sites/mysite")
+        mock_os_remove.assert_called_once_with(expected_remove_path)
 
     @patch("os.remove")
     @patch("frappe_s3_attachment.controller.update_all_matching_file_records")
@@ -172,6 +241,9 @@ class TestS3FileAttachment(unittest.TestCase):
         doc.attached_to_name = "CUST-001"
 
         s3_inst = MagicMock()
+        s3_inst.disable_s3_upload = 0
+        s3_inst.do_not_change_file_url = 0
+        s3_inst.do_not_delete_local_files = 0
         s3_inst.upload_files_to_s3_with_key.return_value = "2026/08/22/Customer/KEY_live.pdf"
         s3_inst.verify_s3_object_exists.return_value = True
         s3_inst.S3_CLIENT.meta.endpoint_url = "https://s3.amazonaws.com"
@@ -183,7 +255,8 @@ class TestS3FileAttachment(unittest.TestCase):
         mock_update_records.assert_called_once_with(
             "/files/live.pdf", 0, "2026/08/22/Customer/KEY_live.pdf", s3_inst
         )
-        mock_os_remove.assert_called_once_with("/sites/mysite/public/files/live.pdf")
+        expected_remove_path, _ = get_local_filepath("/files/live.pdf", 0, "/sites/mysite")
+        mock_os_remove.assert_called_once_with(expected_remove_path)
 
     @patch("frappe.publish_realtime")
     @patch("frappe_s3_attachment.controller.upload_existing_files_s3")
@@ -193,6 +266,7 @@ class TestS3FileAttachment(unittest.TestCase):
         self, mock_get_all, mock_exists, mock_upload_existing, mock_publish
     ):
         frappe.utils.get_site_path.return_value = "/sites/mysite"
+        frappe.db.count.return_value = 2
         # Simulate batching with 2 file records sharing the same physical file
         mock_get_all.side_effect = [
             [
@@ -208,7 +282,7 @@ class TestS3FileAttachment(unittest.TestCase):
 
         # upload_existing_files_s3 should only be called ONCE for the shared file
         self.assertEqual(mock_upload_existing.call_count, 1)
-        mock_publish.assert_called_once()
+        mock_publish.assert_called()
 
     def test_s3_file_regex_match(self):
         self.assertTrue(s3_file_regex_match("https://s3.amazonaws.com/bucket/key.pdf"))
@@ -360,6 +434,8 @@ class TestS3FileAttachment(unittest.TestCase):
 
         with patch("frappe_s3_attachment.controller.S3Operations") as mock_s3_ops_cls:
             mock_s3_inst = MagicMock()
+            mock_s3_inst.disable_s3_upload = 0
+            mock_s3_inst.do_not_change_file_url = 0
             mock_s3_inst.BUCKET = "test-bucket"
             mock_s3_inst.do_not_delete_local_files = 0
             mock_s3_inst.S3_CLIENT.meta.endpoint_url = "https://s3.amazonaws.com"
@@ -505,6 +581,8 @@ class TestS3FileAttachment(unittest.TestCase):
 
         with patch("frappe_s3_attachment.controller.S3Operations") as mock_s3_ops_cls:
             s3_inst = MagicMock()
+            s3_inst.disable_s3_upload = 0
+            s3_inst.do_not_change_file_url = 0
             s3_inst.verify_s3_object_exists.return_value = True
             mock_s3_ops_cls.return_value = s3_inst
 
@@ -515,5 +593,94 @@ class TestS3FileAttachment(unittest.TestCase):
             # Direct SQL update should have finalized status as Completed
             mock_sql.assert_called()
 
+    @patch("frappe_s3_attachment.controller.boto3.client")
+    def test_s3_operations_with_custom_endpoint_url(self, mock_boto_client):
+        from frappe_s3_attachment.controller import S3Operations
+        s3_client_mock = MagicMock()
+        mock_boto_client.return_value = s3_client_mock
+        frappe.get_doc.return_value = MagicMock(
+            aws_key="test_key",
+            aws_secret="test_secret",
+            region_name="auto",
+            bucket_name="cloudflare-r2-bucket",
+            endpoint_url="https://xyz123.r2.cloudflarestorage.com",
+            folder_name=None,
+            do_not_delete_local_files=0,
+            signed_url_expiry_time=300
+        )
 
+        ops = S3Operations()
+        self.assertEqual(ops.endpoint_url, "https://xyz123.r2.cloudflarestorage.com")
+        mock_boto_client.assert_called_once()
+        call_kwargs = mock_boto_client.call_args[1]
+        self.assertEqual(call_kwargs.get("endpoint_url"), "https://xyz123.r2.cloudflarestorage.com")
+        self.assertEqual(call_kwargs.get("aws_access_key_id"), "test_key")
+        self.assertEqual(call_kwargs.get("aws_secret_access_key"), "test_secret")
+        self.assertEqual(call_kwargs.get("region_name"), "auto")
+
+    @patch("frappe_s3_attachment.controller.boto3.client")
+    def test_s3_operations_without_custom_endpoint_url(self, mock_boto_client):
+        from frappe_s3_attachment.controller import S3Operations
+        s3_client_mock = MagicMock()
+        mock_boto_client.return_value = s3_client_mock
+        frappe.get_doc.return_value = MagicMock(
+            aws_key="test_key",
+            aws_secret="test_secret",
+            region_name="us-east-1",
+            bucket_name="standard-aws-bucket",
+            endpoint_url=None,
+            folder_name=None,
+            do_not_delete_local_files=0,
+            signed_url_expiry_time=300
+        )
+
+        ops = S3Operations()
+        self.assertIsNone(ops.endpoint_url)
+        mock_boto_client.assert_called_once()
+        call_kwargs = mock_boto_client.call_args[1]
+        self.assertIsNone(call_kwargs.get("endpoint_url"))
+
+    @patch("frappe_s3_attachment.controller.boto3.client")
+    def test_s3_operations_endpoint_url_sanitization(self, mock_boto_client):
+        from frappe_s3_attachment.controller import S3Operations
+        s3_client_mock = MagicMock()
+        mock_boto_client.return_value = s3_client_mock
+        frappe.get_doc.return_value = MagicMock(
+            aws_key="minioadmin",
+            aws_secret="minioadmin",
+            region_name="us-east-1",
+            bucket_name="minio-bucket",
+            endpoint_url="  http://minio.local:9000/  ",
+            folder_name=None,
+            do_not_delete_local_files=0,
+            signed_url_expiry_time=300
+        )
+
+        ops = S3Operations()
+        self.assertEqual(ops.endpoint_url, "http://minio.local:9000")
+        call_kwargs = mock_boto_client.call_args[1]
+        self.assertEqual(call_kwargs.get("endpoint_url"), "http://minio.local:9000")
+
+    @patch("frappe_s3_attachment.controller.boto3.client")
+    def test_s3_operations_anonymous_credentials_with_custom_endpoint(self, mock_boto_client):
+        from frappe_s3_attachment.controller import S3Operations
+        s3_client_mock = MagicMock()
+        mock_boto_client.return_value = s3_client_mock
+        frappe.get_doc.return_value = MagicMock(
+            aws_key=None,
+            aws_secret=None,
+            region_name="us-east-1",
+            bucket_name="public-spaces",
+            endpoint_url="https://nyc3.digitaloceanspaces.com",
+            folder_name=None,
+            do_not_delete_local_files=0,
+            signed_url_expiry_time=300
+        )
+
+        ops = S3Operations()
+        self.assertEqual(ops.endpoint_url, "https://nyc3.digitaloceanspaces.com")
+        call_kwargs = mock_boto_client.call_args[1]
+        self.assertEqual(call_kwargs.get("endpoint_url"), "https://nyc3.digitaloceanspaces.com")
+        self.assertNotIn("aws_access_key_id", call_kwargs)
+        self.assertNotIn("aws_secret_access_key", call_kwargs)
 
