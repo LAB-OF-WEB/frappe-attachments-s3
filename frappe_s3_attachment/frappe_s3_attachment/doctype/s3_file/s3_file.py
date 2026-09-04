@@ -6,7 +6,11 @@ from __future__ import unicode_literals
 import os
 import frappe
 from frappe.model.document import Document
-from frappe_s3_attachment.controller import S3Operations, get_local_filepath
+from frappe_s3_attachment.controller import (
+    S3Operations,
+    get_local_filepath,
+    check_s3_admin_permission,
+)
 
 
 class S3File(Document):
@@ -17,6 +21,15 @@ class S3File(Document):
         Download the object from AWS S3, write it back to the local server disk,
         and revert all modified tabFile records and DocType image fields back to original_file_url.
         """
+        if not batch_mode:
+            if hasattr(self, "check_permission") and callable(self.check_permission):
+                try:
+                    self.check_permission("write")
+                except TypeError:
+                    self.check_permission()
+            else:
+                check_s3_admin_permission()
+
         if self.status == "Restored":
             if not batch_mode:
                 frappe.msgprint(frappe._("This file has already been restored to disk."))

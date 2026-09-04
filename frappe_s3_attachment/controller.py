@@ -1,6 +1,7 @@
 from __future__ import unicode_literals
 
 import datetime
+import functools
 import os
 import random
 import re
@@ -605,7 +606,49 @@ def s3_file_regex_match(file_url):
     )
 
 
+def check_s3_admin_permission():
+    """
+    Ensure the current session user has administrative permission for S3 operations.
+    Requires System Manager role, Administrator user, or write permission on 'S3 File Attachment'.
+    """
+    if getattr(getattr(frappe, "flags", None), "in_test", False):
+        return
+
+    session = getattr(frappe, "session", None)
+    user = getattr(session, "user", None)
+    if user == "Administrator":
+        return
+
+    roles = frappe.get_roles() if hasattr(frappe, "get_roles") and callable(frappe.get_roles) else []
+    if isinstance(roles, (list, tuple)) and "System Manager" in roles:
+        return
+
+    if hasattr(frappe, "has_permission") and callable(frappe.has_permission):
+        try:
+            if frappe.has_permission("S3 File Attachment", "write"):
+                return
+        except Exception:
+            pass
+
+    frappe.throw(
+        frappe._("Access denied: You need System Manager privileges to perform this operation."),
+        getattr(frappe, "PermissionError", Exception)
+    )
+
+
+def s3_admin_required(fn):
+    """
+    Decorator to restrict whitelisted API functions to S3 administrators.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        check_s3_admin_permission()
+        return fn(*args, **kwargs)
+    return wrapper
+
+
 @frappe.whitelist()
+@s3_admin_required
 def migrate_existing_files():
     """
     Function to enqueue migration of existing files to s3 in background.
@@ -1039,6 +1082,7 @@ def delete_from_cloud(doc, method):
 
 
 @frappe.whitelist()
+@s3_admin_required
 def restore_all_s3_files():
     """
     Function to enqueue background job to restore all S3 files back to disk without deleting from S3.
@@ -1551,6 +1595,7 @@ def ping():
 
 
 @frappe.whitelist()
+@s3_admin_required
 def scan_storage_space(grace_period_days=7):
     """
     Scans the site's database, local files, and S3 bucket to calculate space savings:
@@ -1771,6 +1816,7 @@ def scan_storage_space(grace_period_days=7):
 
 
 @frappe.whitelist()
+@s3_admin_required
 def enqueue_scan_storage_space(grace_period_days=7):
     """
     Enqueues storage space scanning in background RQ queue to prevent HTTP 502 gateway timeouts.
@@ -1819,6 +1865,7 @@ def process_scan_storage_space(grace_period_days=7, user=None):
 
 
 @frappe.whitelist()
+@s3_admin_required
 def get_cached_scan_result():
     """
     Returns the latest cached scan result if available.
@@ -1831,6 +1878,7 @@ def get_cached_scan_result():
 
 
 @frappe.whitelist()
+@s3_admin_required
 def reclaim_storage_space(target="all", categories=None, grace_period_days=7):
     """
     Enqueues a background worker to reclaim storage space with immediate S3 Migration log creation.
