@@ -10,10 +10,10 @@ Security updates and critical patches are actively provided for the following ve
 
 | Frappe Version | App Version | Supported          |
 |----------------|-------------|--------------------|
-| Frappe v16.x   | 1.x / Latest| :white_check_mark: |
-| Frappe v15.x   | 1.x / Latest| :white_check_mark: |
-| Frappe v14.x   | 1.x / Latest| :white_check_mark: |
-| Frappe < v14   | < 1.0       | :x:                |
+| Frappe v16.x   | 2.x / Latest| :white_check_mark: |
+| Frappe v15.x   | 2.x / Latest| :white_check_mark: |
+| Frappe v14.x   | 2.x / Latest| :white_check_mark: |
+| Frappe < v14   | < 2.0       | :x:                |
 
 ---
 

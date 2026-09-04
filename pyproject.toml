@@ -1,6 +1,6 @@
 [project]
 name = "frappe_s3_attachment"
-version = "1.0.0"
+version = "2.0.0"
 description = "A frappe app to upload file attachments in doctypes to s3."
 readme = "README.md"
 requires-python = ">=3.8"
