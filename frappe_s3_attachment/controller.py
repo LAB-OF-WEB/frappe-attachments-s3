@@ -1720,7 +1720,7 @@ def ping():
 
 @frappe.whitelist()
 @s3_admin_required
-def scan_storage_space(grace_period_days=7):
+def scan_storage_space(grace_period_days=7, scope="all", fast_scan=True):
     """
     Scans the site's database, local files, and S3 bucket to calculate space savings:
     Local Disk Storage:
@@ -1732,177 +1732,255 @@ def scan_storage_space(grace_period_days=7):
       - orphaned_s3_attachments: S3 cloud objects whose parent DocType was deleted.
       - unlinked_s3_files: S3 cloud objects of abandoned unlinked File records (> grace_period_days).
       - unreferenced_s3_objects: Objects in S3 bucket with no matching tabFile or tabS3 File.
+
+    :param grace_period_days: Days before unlinked files are considered eligible for cleanup.
+    :param scope: "all", "disk", or "s3".
+    :param fast_scan: When True, skips expensive raw S3 bucket crawl and focuses on DB/disk diffs.
     """
     try:
         grace_period_days = int(grace_period_days or 7)
     except (ValueError, TypeError):
         grace_period_days = 7
 
+    if isinstance(fast_scan, str):
+        fast_scan = fast_scan.lower() in ("true", "1", "yes")
+    else:
+        fast_scan = bool(fast_scan)
+
+    scope = scope or "all"
+    if scope not in ("all", "disk", "s3"):
+        scope = "all"
+
+    scan_disk = scope in ("all", "disk")
+    scan_s3 = scope in ("all", "s3")
+
     site_path = frappe.utils.get_site_path()
     s3_ops = S3Operations()
 
     disk_summary = {
-        "duplicate_local_files": {"count": 0, "bytes": 0, "mb": 0.0},
-        "orphaned_disk_attachments": {"count": 0, "bytes": 0, "mb": 0.0},
-        "unlinked_disk_files": {"count": 0, "bytes": 0, "mb": 0.0},
-        "unreferenced_disk_files": {"count": 0, "bytes": 0, "mb": 0.0},
+        "duplicate_local_files": {"count": 0, "bytes": 0, "mb": 0.0, "samples": []},
+        "orphaned_disk_attachments": {"count": 0, "bytes": 0, "mb": 0.0, "samples": []},
+        "unlinked_disk_files": {"count": 0, "bytes": 0, "mb": 0.0, "samples": []},
+        "unreferenced_disk_files": {"count": 0, "bytes": 0, "mb": 0.0, "samples": []},
         "total_files": 0,
         "total_bytes": 0,
         "total_mb": 0.0
     }
 
     s3_summary = {
-        "orphaned_s3_attachments": {"count": 0, "bytes": 0, "mb": 0.0},
-        "unlinked_s3_files": {"count": 0, "bytes": 0, "mb": 0.0},
-        "unreferenced_s3_objects": {"count": 0, "bytes": 0, "mb": 0.0},
+        "orphaned_s3_attachments": {"count": 0, "bytes": 0, "mb": 0.0, "samples": []},
+        "unlinked_s3_files": {"count": 0, "bytes": 0, "mb": 0.0, "samples": []},
+        "unreferenced_s3_objects": {"count": 0, "bytes": 0, "mb": 0.0, "samples": []},
         "total_files": 0,
         "total_bytes": 0,
         "total_mb": 0.0
     }
 
-    # Duplicate Local Disk Files (Files on S3 that have a redundant local disk copy)
-    try:
-        s3_files = frappe.get_all(
-            "S3 File",
-            filters={"status": "Active"},
-            fields=["name", "original_file_url", "is_private", "file_name"]
-        )
-        for sf in s3_files:
-            orig_url = sf.get("original_file_url")
-            if orig_url:
-                local_path, _ = get_local_filepath(orig_url, sf.get("is_private"), site_path)
+    def add_sample(cat_dict, name, file_name, file_url, fsize, extra=None):
+        if len(cat_dict.get("samples", [])) < 10:
+            cat_dict.setdefault("samples", []).append({
+                "name": name or "",
+                "file_name": file_name or "",
+                "file_url": file_url or "",
+                "size_mb": round((fsize or 0) / (1024.0 * 1024.0), 2),
+                "info": extra or ""
+            })
+
+    # 1. Duplicate Local Disk Files (Files on S3 that have a redundant local disk copy)
+    if scan_disk:
+        try:
+            s3_files = frappe.get_all(
+                "S3 File",
+                filters={"status": "Active"},
+                fields=["name", "original_file_url", "is_private", "file_name"]
+            )
+            for sf in s3_files:
+                orig_url = sf.get("original_file_url")
+                if orig_url:
+                    local_path, _ = get_local_filepath(orig_url, sf.get("is_private"), site_path)
+                    if os.path.exists(local_path):
+                        fsize = os.path.getsize(local_path)
+                        disk_summary["duplicate_local_files"]["count"] += 1
+                        disk_summary["duplicate_local_files"]["bytes"] += fsize
+                        add_sample(disk_summary["duplicate_local_files"], sf.get("name"), sf.get("file_name"), orig_url, fsize, "Active in S3 File")
+
+            files_with_s3_url = frappe.db.sql(
+                """
+                SELECT name, file_url, is_private, file_name, file_size
+                FROM `tabFile`
+                WHERE file_url LIKE 'http://%' OR file_url LIKE 'https://%' OR file_url LIKE '/api/method/frappe_s3_attachment%'
+                """,
+                as_dict=True
+            )
+            for f in files_with_s3_url:
+                local_path, _ = get_local_filepath(f.get("file_url"), f.get("is_private"), site_path)
                 if os.path.exists(local_path):
-                    fsize = os.path.getsize(local_path)
-                    disk_summary["duplicate_local_files"]["count"] += 1
-                    disk_summary["duplicate_local_files"]["bytes"] += fsize
+                    already_counted = any(sf.get("original_file_url") == f.get("file_url") for sf in s3_files)
+                    if not already_counted:
+                        fsize = os.path.getsize(local_path)
+                        disk_summary["duplicate_local_files"]["count"] += 1
+                        disk_summary["duplicate_local_files"]["bytes"] += fsize
+                        add_sample(disk_summary["duplicate_local_files"], f.get("name"), f.get("file_name"), f.get("file_url"), fsize, "Direct S3 URL in tabFile")
+        except Exception as e:
+            frappe.logger().error("Error scanning duplicate local files: {0}".format(str(e)))
 
-        files_with_s3_url = frappe.db.sql(
-            """
-            SELECT name, file_url, is_private, file_name, file_size
-            FROM `tabFile`
-            WHERE file_url LIKE 'http://%' OR file_url LIKE 'https://%' OR file_url LIKE '/api/method/frappe_s3_attachment%'
-            """,
-            as_dict=True
-        )
-        for f in files_with_s3_url:
-            local_path, _ = get_local_filepath(f.get("file_url"), f.get("is_private"), site_path)
-            if os.path.exists(local_path):
-                already_counted = any(sf.get("original_file_url") == f.get("file_url") for sf in s3_files)
-                if not already_counted:
-                    fsize = os.path.getsize(local_path)
-                    disk_summary["duplicate_local_files"]["count"] += 1
-                    disk_summary["duplicate_local_files"]["bytes"] += fsize
-    except Exception as e:
-        frappe.logger().error("Error scanning duplicate local files: {0}".format(str(e)))
+    # 2. Orphaned Attachments (parent document deleted)
+    if scan_disk or scan_s3:
+        try:
+            attached_files = frappe.db.sql(
+                """
+                SELECT name, file_name, file_url, file_size, content_hash, attached_to_doctype, attached_to_name, is_private
+                FROM `tabFile`
+                WHERE attached_to_doctype IS NOT NULL
+                  AND attached_to_doctype != ''
+                  AND attached_to_name IS NOT NULL
+                  AND attached_to_name != ''
+                """,
+                as_dict=True
+            )
 
-    # Orphaned Attachments (parent document deleted)
-    try:
-        attached_files = frappe.db.sql(
-            """
-            SELECT name, file_name, file_url, file_size, content_hash, attached_to_doctype, attached_to_name, is_private
-            FROM `tabFile`
-            WHERE attached_to_doctype IS NOT NULL
-              AND attached_to_doctype != ''
-              AND attached_to_name IS NOT NULL
-              AND attached_to_name != ''
-            """,
-            as_dict=True
-        )
-        for af in attached_files:
-            dt = af.get("attached_to_doctype")
-            dn = af.get("attached_to_name")
-            try:
-                if not frappe.db.exists(dt, dn):
-                    fsize = af.get("file_size") or 0
-                    local_path, _ = get_local_filepath(af.get("file_url"), af.get("is_private"), site_path)
+            # Performance optimization: batch check parent document existence when file list is large (> 20)
+            parent_exists_cache = {}
+            if len(attached_files) > 20:
+                from collections import defaultdict
+                dt_to_names = defaultdict(set)
+                for af in attached_files:
+                    dt = af.get("attached_to_doctype")
+                    dn = af.get("attached_to_name")
+                    if dt and dn:
+                        dt_to_names[dt].add(dn)
+
+                for dt, names in dt_to_names.items():
+                    try:
+                        table_exists = True
+                        if hasattr(frappe.db, "table_exists"):
+                            table_exists = frappe.db.table_exists(dt)
+                        if not table_exists:
+                            for dn in names:
+                                parent_exists_cache[(dt, dn)] = False
+                            continue
+
+                        name_list = list(names)
+                        chunk_size = 500
+                        for i in range(0, len(name_list), chunk_size):
+                            chunk = name_list[i:i + chunk_size]
+                            existing = set(frappe.get_all(dt, filters={"name": ["in", chunk]}, pluck="name"))
+                            for dn in chunk:
+                                parent_exists_cache[(dt, dn)] = (dn in existing)
+                    except Exception:
+                        pass
+
+            for af in attached_files:
+                dt = af.get("attached_to_doctype")
+                dn = af.get("attached_to_name")
+                try:
+                    if (dt, dn) in parent_exists_cache:
+                        doc_exists = parent_exists_cache[(dt, dn)]
+                    else:
+                        doc_exists = frappe.db.exists(dt, dn)
+
+                    if not doc_exists:
+                        fsize = af.get("file_size") or 0
+                        if scan_disk:
+                            local_path, _ = get_local_filepath(af.get("file_url"), af.get("is_private"), site_path)
+                            if os.path.exists(local_path):
+                                disk_fsize = os.path.getsize(local_path)
+                                disk_summary["orphaned_disk_attachments"]["count"] += 1
+                                disk_summary["orphaned_disk_attachments"]["bytes"] += disk_fsize
+                                add_sample(disk_summary["orphaned_disk_attachments"], af.get("name"), af.get("file_name"), af.get("file_url"), disk_fsize, "{0} #{1}".format(dt, dn))
+
+                        if scan_s3 and af.get("content_hash") and "/" in af.get("content_hash"):
+                            s3_summary["orphaned_s3_attachments"]["count"] += 1
+                            s3_summary["orphaned_s3_attachments"]["bytes"] += fsize
+                            add_sample(s3_summary["orphaned_s3_attachments"], af.get("name"), af.get("file_name"), af.get("file_url"), fsize, "{0} #{1}".format(dt, dn))
+                except Exception:
+                    pass
+        except Exception as e:
+            frappe.logger().error("Error scanning orphaned attachments: {0}".format(str(e)))
+
+    # 3. Abandoned Unlinked Files (> grace_period_days old)
+    if scan_disk or scan_s3:
+        try:
+            cutoff_dt = datetime.datetime.now() - datetime.timedelta(days=grace_period_days)
+            unlinked = frappe.db.sql(
+                """
+                SELECT name, file_name, file_url, file_size, content_hash, is_private
+                FROM `tabFile`
+                WHERE (attached_to_doctype IS NULL OR attached_to_doctype = '' OR attached_to_doctype = 'File')
+                  AND creation < %s
+                """,
+                (cutoff_dt,),
+                as_dict=True
+            )
+            for uf in unlinked:
+                fsize = uf.get("file_size") or 0
+                if scan_disk:
+                    local_path, _ = get_local_filepath(uf.get("file_url"), uf.get("is_private"), site_path)
                     if os.path.exists(local_path):
                         disk_fsize = os.path.getsize(local_path)
-                        disk_summary["orphaned_disk_attachments"]["count"] += 1
-                        disk_summary["orphaned_disk_attachments"]["bytes"] += disk_fsize
+                        disk_summary["unlinked_disk_files"]["count"] += 1
+                        disk_summary["unlinked_disk_files"]["bytes"] += disk_fsize
+                        add_sample(disk_summary["unlinked_disk_files"], uf.get("name"), uf.get("file_name"), uf.get("file_url"), disk_fsize, "> {0} days old".format(grace_period_days))
 
-                    if af.get("content_hash") and "/" in af.get("content_hash"):
-                        s3_summary["orphaned_s3_attachments"]["count"] += 1
-                        s3_summary["orphaned_s3_attachments"]["bytes"] += fsize
-            except Exception:
-                pass
-    except Exception as e:
-        frappe.logger().error("Error scanning orphaned attachments: {0}".format(str(e)))
+                if scan_s3 and uf.get("content_hash") and "/" in uf.get("content_hash"):
+                    s3_summary["unlinked_s3_files"]["count"] += 1
+                    s3_summary["unlinked_s3_files"]["bytes"] += fsize
+                    add_sample(s3_summary["unlinked_s3_files"], uf.get("name"), uf.get("file_name"), uf.get("file_url"), fsize, "> {0} days old".format(grace_period_days))
+        except Exception as e:
+            frappe.logger().error("Error scanning unlinked files: {0}".format(str(e)))
 
-    # Abandoned Unlinked Files (> grace_period_days old)
-    try:
-        cutoff_dt = datetime.datetime.now() - datetime.timedelta(days=grace_period_days)
-        unlinked = frappe.db.sql(
-            """
-            SELECT name, file_name, file_url, file_size, content_hash, is_private
-            FROM `tabFile`
-            WHERE (attached_to_doctype IS NULL OR attached_to_doctype = '' OR attached_to_doctype = 'File')
-              AND creation < %s
-            """,
-            (cutoff_dt,),
-            as_dict=True
-        )
-        for uf in unlinked:
-            fsize = uf.get("file_size") or 0
-            local_path, _ = get_local_filepath(uf.get("file_url"), uf.get("is_private"), site_path)
-            if os.path.exists(local_path):
-                disk_fsize = os.path.getsize(local_path)
-                disk_summary["unlinked_disk_files"]["count"] += 1
-                disk_summary["unlinked_disk_files"]["bytes"] += disk_fsize
+    # 4. Unreferenced Local Disk Files
+    if scan_disk:
+        try:
+            db_urls = set()
+            file_urls = frappe.db.sql("SELECT file_url FROM `tabFile` WHERE file_url IS NOT NULL", as_dict=True)
+            for r in file_urls:
+                db_urls.add(r["file_url"].strip())
 
-            if uf.get("content_hash") and "/" in uf.get("content_hash"):
-                s3_summary["unlinked_s3_files"]["count"] += 1
-                s3_summary["unlinked_s3_files"]["bytes"] += fsize
-    except Exception as e:
-        frappe.logger().error("Error scanning unlinked files: {0}".format(str(e)))
+            s3_orig_urls = frappe.db.sql("SELECT original_file_url FROM `tabS3 File` WHERE original_file_url IS NOT NULL", as_dict=True)
+            for r in s3_orig_urls:
+                db_urls.add(r["original_file_url"].strip())
 
-    # Unreferenced Local Disk Files
-    try:
-        db_urls = set()
-        file_urls = frappe.db.sql("SELECT file_url FROM `tabFile` WHERE file_url IS NOT NULL", as_dict=True)
-        for r in file_urls:
-            db_urls.add(r["file_url"].strip())
+            for is_pvt, folder_name in [(0, "files"), (1, os.path.join("private", "files"))]:
+                folder_path = os.path.join(site_path, "public", "files") if not is_pvt else os.path.join(site_path, "private", "files")
+                if os.path.exists(folder_path):
+                    for root, _, files in os.walk(folder_path):
+                        for fn in files:
+                            if fn.startswith("."):
+                                continue
+                            f_full = os.path.join(root, fn)
+                            rel_url = "/files/" + fn if not is_pvt else "/private/files/" + fn
+                            if rel_url not in db_urls:
+                                fsize = os.path.getsize(f_full)
+                                disk_summary["unreferenced_disk_files"]["count"] += 1
+                                disk_summary["unreferenced_disk_files"]["bytes"] += fsize
+                                add_sample(disk_summary["unreferenced_disk_files"], "", fn, rel_url, fsize, "No DB record on disk")
+        except Exception as e:
+            frappe.logger().error("Error scanning unreferenced disk files: {0}".format(str(e)))
 
-        s3_orig_urls = frappe.db.sql("SELECT original_file_url FROM `tabS3 File` WHERE original_file_url IS NOT NULL", as_dict=True)
-        for r in s3_orig_urls:
-            db_urls.add(r["original_file_url"].strip())
+    # 5. Unreferenced S3 Objects (Skipped in Fast Scan mode for instantaneous results)
+    if scan_s3 and not fast_scan:
+        try:
+            if s3_ops.S3_CLIENT and s3_ops.BUCKET:
+                tracked_keys = set()
+                s3_file_keys = frappe.db.sql("SELECT s3_key FROM `tabS3 File` WHERE s3_key IS NOT NULL", as_dict=True)
+                for r in s3_file_keys:
+                    tracked_keys.add(r["s3_key"].strip())
 
-        for is_pvt, folder_name in [(0, "files"), (1, os.path.join("private", "files"))]:
-            folder_path = os.path.join(site_path, "public", "files") if not is_pvt else os.path.join(site_path, "private", "files")
-            if os.path.exists(folder_path):
-                for root, _, files in os.walk(folder_path):
-                    for fn in files:
-                        if fn.startswith("."):
-                            continue
-                        f_full = os.path.join(root, fn)
-                        rel_url = "/files/" + fn if not is_pvt else "/private/files/" + fn
-                        if rel_url not in db_urls:
-                            fsize = os.path.getsize(f_full)
-                            disk_summary["unreferenced_disk_files"]["count"] += 1
-                            disk_summary["unreferenced_disk_files"]["bytes"] += fsize
-    except Exception as e:
-        frappe.logger().error("Error scanning unreferenced disk files: {0}".format(str(e)))
+                content_hashes = frappe.db.sql("SELECT content_hash FROM `tabFile` WHERE content_hash IS NOT NULL AND content_hash LIKE '%/%'", as_dict=True)
+                for r in content_hashes:
+                    tracked_keys.add(r["content_hash"].strip())
 
-    # Unreferenced S3 Objects
-    try:
-        if s3_ops.S3_CLIENT and s3_ops.BUCKET:
-            tracked_keys = set()
-            s3_file_keys = frappe.db.sql("SELECT s3_key FROM `tabS3 File` WHERE s3_key IS NOT NULL", as_dict=True)
-            for r in s3_file_keys:
-                tracked_keys.add(r["s3_key"].strip())
-
-            content_hashes = frappe.db.sql("SELECT content_hash FROM `tabFile` WHERE content_hash IS NOT NULL AND content_hash LIKE '%/%'", as_dict=True)
-            for r in content_hashes:
-                tracked_keys.add(r["content_hash"].strip())
-
-            paginator = s3_ops.S3_CLIENT.get_paginator("list_objects_v2")
-            for page in paginator.paginate(Bucket=s3_ops.BUCKET, PaginationConfig={"MaxItems": 1000}):
-                for obj in page.get("Contents", []):
-                    key = obj["Key"]
-                    if key not in tracked_keys:
-                        s3_summary["unreferenced_s3_objects"]["count"] += 1
-                        s3_summary["unreferenced_s3_objects"]["bytes"] += obj.get("Size", 0)
-    except Exception as e:
-        frappe.logger().error("Error scanning unreferenced S3 objects: {0}".format(str(e)))
+                paginator = s3_ops.S3_CLIENT.get_paginator("list_objects_v2")
+                for page in paginator.paginate(Bucket=s3_ops.BUCKET, PaginationConfig={"MaxItems": 1000}):
+                    for obj in page.get("Contents", []):
+                        key = obj["Key"]
+                        if key not in tracked_keys:
+                            s3_summary["unreferenced_s3_objects"]["count"] += 1
+                            s3_summary["unreferenced_s3_objects"]["bytes"] += obj.get("Size", 0)
+                            add_sample(s3_summary["unreferenced_s3_objects"], "", key, key, obj.get("Size", 0), "Bucket object not in DB")
+        except Exception as e:
+            frappe.logger().error("Error scanning unreferenced S3 objects: {0}".format(str(e)))
 
     # Compute disk MB values
     for cat in ["duplicate_local_files", "orphaned_disk_attachments", "unlinked_disk_files", "unreferenced_disk_files"]:
@@ -1922,17 +2000,22 @@ def scan_storage_space(grace_period_days=7):
     total_bytes = disk_summary["total_bytes"] + s3_summary["total_bytes"]
     total_mb = round(total_bytes / (1024.0 * 1024.0), 2)
 
+    scan_time = str(frappe.utils.now_datetime()) if hasattr(frappe.utils, "now_datetime") else str(datetime.datetime.now())
+
     res = {
         "status": "success",
         "disk_summary": disk_summary,
         "s3_summary": s3_summary,
         "total_files": total_files,
         "total_bytes": total_bytes,
-        "total_mb": total_mb
+        "total_mb": total_mb,
+        "scope": scope,
+        "fast_scan": fast_scan,
+        "scan_time": scan_time
     }
 
     try:
-        frappe.cache().set_value("s3_storage_scan_result", res, expires_in_sec=3600)
+        frappe.cache().set_value("s3_storage_scan_result", res, expires_in_sec=86400)
     except Exception:
         pass
 
@@ -1941,7 +2024,7 @@ def scan_storage_space(grace_period_days=7):
 
 @frappe.whitelist()
 @s3_admin_required
-def enqueue_scan_storage_space(grace_period_days=7):
+def enqueue_scan_storage_space(grace_period_days=7, scope="all", fast_scan=True):
     """
     Enqueues storage space scanning in background RQ queue to prevent HTTP 502 gateway timeouts.
     Emits 's3_storage_scan_complete' via realtime socket.io when finished.
@@ -1951,26 +2034,39 @@ def enqueue_scan_storage_space(grace_period_days=7):
     except (ValueError, TypeError):
         grace_period_days = 7
 
+    if isinstance(fast_scan, str):
+        fast_scan = fast_scan.lower() in ("true", "1", "yes")
+    else:
+        fast_scan = bool(fast_scan)
+
+    scope = scope or "all"
+    if scope not in ("all", "disk", "s3"):
+        scope = "all"
+
     frappe.enqueue(
         "frappe_s3_attachment.controller.process_scan_storage_space",
         queue="default",
         timeout=1800,
         is_async=True,
         grace_period_days=grace_period_days,
+        scope=scope,
+        fast_scan=fast_scan,
         user=frappe.session.user
     )
     return {
         "status": "enqueued",
+        "scope": scope,
+        "fast_scan": fast_scan,
         "message": frappe._("Storage scan enqueued in background.")
     }
 
 
-def process_scan_storage_space(grace_period_days=7, user=None):
+def process_scan_storage_space(grace_period_days=7, scope="all", fast_scan=True, user=None):
     """
     Background worker to scan storage space and notify user via socket.io.
     """
     try:
-        res = scan_storage_space(grace_period_days=grace_period_days)
+        res = scan_storage_space(grace_period_days=grace_period_days, scope=scope, fast_scan=fast_scan)
         frappe.publish_realtime(
             "s3_storage_scan_complete",
             res,
@@ -2003,11 +2099,12 @@ def get_cached_scan_result():
 
 @frappe.whitelist()
 @s3_admin_required
-def reclaim_storage_space(target="all", categories=None, grace_period_days=7):
+def reclaim_storage_space(target="all", categories=None, grace_period_days=7, dry_run=False):
     """
     Enqueues a background worker to reclaim storage space with immediate S3 Migration log creation.
     :param target: "disk", "s3", or "all".
     :param categories: specific list of categories to clean.
+    :param dry_run: if True, simulates deletion and logs warnings without deleting files.
     """
     if isinstance(categories, str):
         import json
@@ -2021,8 +2118,15 @@ def reclaim_storage_space(target="all", categories=None, grace_period_days=7):
     except (ValueError, TypeError):
         grace_period_days = 7
 
+    if isinstance(dry_run, str):
+        dry_run = dry_run.lower() in ("true", "1", "yes")
+    else:
+        dry_run = bool(dry_run)
+
     target = target or "all"
     target_label = "Disk and S3" if target == "all" else ("Disk" if target == "disk" else "S3 Cloud")
+    if dry_run:
+        target_label = "Dry Run ({0})".format(target_label)
 
     migration_doc_name = None
     try:
@@ -2047,20 +2151,23 @@ def reclaim_storage_space(target="all", categories=None, grace_period_days=7):
         categories=categories,
         grace_period_days=grace_period_days,
         user=frappe.session.user,
-        migration_doc_name=migration_doc_name
+        migration_doc_name=migration_doc_name,
+        dry_run=dry_run
     )
     return {
         "status": "enqueued",
         "migration_doc": migration_doc_name,
+        "dry_run": dry_run,
         "message": frappe._("{0} storage space reclamation has been enqueued in the background.").format(target_label)
     }
 
 
-def process_storage_cleanup(target="all", categories=None, grace_period_days=7, user=None, migration_doc_name=None):
+def process_storage_cleanup(target="all", categories=None, grace_period_days=7, user=None, migration_doc_name=None, dry_run=False):
     """
     Background worker to execute storage cleanup across:
     Disk: duplicate_local_files, orphaned_disk_attachments, unlinked_disk_files, unreferenced_disk_files
     S3: orphaned_s3_attachments, unlinked_s3_files, unreferenced_s3_objects
+    :param dry_run: If True, simulates operations and records logs without removing physical or DB files.
     """
     import gc
     import traceback
@@ -2085,7 +2192,8 @@ def process_storage_cleanup(target="all", categories=None, grace_period_days=7, 
             migration_doc.status = "In Progress"
             migration_doc.started_at = frappe.utils.now_datetime()
             migration_doc.initiated_by = user or frappe.session.user
-            migration_doc.current_phase = "Initializing storage reclamation ({0})...".format(target)
+            op_name = "Dry Run ({0})".format(target) if dry_run else target
+            migration_doc.current_phase = "Initializing storage reclamation ({0})...".format(op_name)
             migration_doc.insert(ignore_permissions=True)
             frappe.db.commit()
             migration_doc_name = migration_doc.name
@@ -2175,7 +2283,10 @@ def process_storage_cleanup(target="all", categories=None, grace_period_days=7, 
                     try:
                         if s3_key and s3_ops.verify_s3_object_exists(s3_key):
                             fsize = os.path.getsize(local_path)
-                            os.remove(local_path)
+                            if not dry_run:
+                                os.remove(local_path)
+                            else:
+                                add_warning(sf.get("name"), sf.get("file_name"), orig_url, "Dry Run", "Simulated removal of redundant local file (S3 verified)")
                             disk_bytes_reclaimed += fsize
                             deleted_count += 1
                         else:
@@ -2215,15 +2326,21 @@ def process_storage_cleanup(target="all", categories=None, grace_period_days=7, 
                         if os.path.exists(local_path):
                             fsize = os.path.getsize(local_path)
                             try:
-                                os.remove(local_path)
+                                if not dry_run:
+                                    os.remove(local_path)
+                                else:
+                                    add_warning(af.get("name"), af.get("file_name"), af.get("file_url"), "Dry Run", "Simulated removal of orphaned disk file")
                                 disk_bytes_reclaimed += fsize
                                 deleted_count += 1
                             except OSError:
                                 pass
                         # If S3 is not being cleaned in this pass, delete the DB row
                         if target == "disk" and "orphaned_s3_attachments" not in categories:
-                            frappe.delete_doc("File", af["name"], ignore_permissions=True, force=True)
-                            frappe.db.commit()
+                            if not dry_run:
+                                frappe.delete_doc("File", af["name"], ignore_permissions=True, force=True)
+                                frappe.db.commit()
+                            else:
+                                add_warning(af.get("name"), af.get("file_name"), af.get("file_url"), "Dry Run", "Simulated deletion of File record")
                     else:
                         skipped_count += 1
                 except Exception as e:
@@ -2255,14 +2372,20 @@ def process_storage_cleanup(target="all", categories=None, grace_period_days=7, 
                     if os.path.exists(local_path):
                         fsize = os.path.getsize(local_path)
                         try:
-                            os.remove(local_path)
+                            if not dry_run:
+                                os.remove(local_path)
+                            else:
+                                add_warning(uf.get("name"), uf.get("file_name"), uf.get("file_url"), "Dry Run", "Simulated removal of unlinked disk file")
                             disk_bytes_reclaimed += fsize
                             deleted_count += 1
                         except OSError:
                             pass
                     if target == "disk" and "unlinked_s3_files" not in categories:
-                        frappe.delete_doc("File", uf["name"], ignore_permissions=True, force=True)
-                        frappe.db.commit()
+                        if not dry_run:
+                            frappe.delete_doc("File", uf["name"], ignore_permissions=True, force=True)
+                            frappe.db.commit()
+                        else:
+                            add_warning(uf.get("name"), uf.get("file_name"), uf.get("file_url"), "Dry Run", "Simulated deletion of unlinked File record")
                 except Exception as e:
                     failed_count += 1
                     add_warning(uf.get("name"), uf.get("file_name"), uf.get("file_url"), "Error", str(e))
@@ -2297,7 +2420,10 @@ def process_storage_cleanup(target="all", categories=None, grace_period_days=7, 
                             if rel_url not in db_urls:
                                 try:
                                     fsize = os.path.getsize(f_full)
-                                    os.remove(f_full)
+                                    if not dry_run:
+                                        os.remove(f_full)
+                                    else:
+                                        add_warning("", fn, rel_url, "Dry Run", "Simulated removal of unreferenced local disk file")
                                     disk_bytes_reclaimed += fsize
                                     deleted_count += 1
                                 except Exception as e:
@@ -2336,13 +2462,19 @@ def process_storage_cleanup(target="all", categories=None, grace_period_days=7, 
                     if not frappe.db.exists(dt, dn):
                         if s3_ops.s3_settings_doc.delete_file_from_cloud and af.get("content_hash") and "/" in af.get("content_hash"):
                             try:
-                                s3_ops.delete_from_s3(af.get("content_hash"))
+                                if not dry_run:
+                                    s3_ops.delete_from_s3(af.get("content_hash"))
+                                else:
+                                    add_warning(af.get("name"), af.get("file_name"), af.get("file_url"), "Dry Run", "Simulated deletion of orphaned S3 cloud object")
                                 s3_bytes_reclaimed += (af.get("file_size") or 0)
                                 deleted_count += 1
                             except Exception:
                                 pass
-                        frappe.delete_doc("File", af["name"], ignore_permissions=True, force=True)
-                        frappe.db.commit()
+                        if not dry_run:
+                            frappe.delete_doc("File", af["name"], ignore_permissions=True, force=True)
+                            frappe.db.commit()
+                        else:
+                            add_warning(af.get("name"), af.get("file_name"), af.get("file_url"), "Dry Run", "Simulated deletion of orphaned File record")
                     else:
                         skipped_count += 1
                 except Exception as e:
@@ -2372,13 +2504,19 @@ def process_storage_cleanup(target="all", categories=None, grace_period_days=7, 
                 try:
                     if s3_ops.s3_settings_doc.delete_file_from_cloud and uf.get("content_hash") and "/" in uf.get("content_hash"):
                         try:
-                            s3_ops.delete_from_s3(uf.get("content_hash"))
+                            if not dry_run:
+                                s3_ops.delete_from_s3(uf.get("content_hash"))
+                            else:
+                                add_warning(uf.get("name"), uf.get("file_name"), uf.get("file_url"), "Dry Run", "Simulated deletion of unlinked S3 cloud object")
                             s3_bytes_reclaimed += (uf.get("file_size") or 0)
                             deleted_count += 1
                         except Exception:
                             pass
-                    frappe.delete_doc("File", uf["name"], ignore_permissions=True, force=True)
-                    frappe.db.commit()
+                    if not dry_run:
+                        frappe.delete_doc("File", uf["name"], ignore_permissions=True, force=True)
+                        frappe.db.commit()
+                    else:
+                        add_warning(uf.get("name"), uf.get("file_name"), uf.get("file_url"), "Dry Run", "Simulated deletion of unlinked File record")
                 except Exception as e:
                     failed_count += 1
                     add_warning(uf.get("name"), uf.get("file_name"), uf.get("file_url"), "Error", str(e))
@@ -2406,7 +2544,10 @@ def process_storage_cleanup(target="all", categories=None, grace_period_days=7, 
                     key = obj["Key"]
                     if key not in tracked_keys:
                         try:
-                            s3_ops.S3_CLIENT.delete_object(Bucket=s3_ops.BUCKET, Key=key)
+                            if not dry_run:
+                                s3_ops.S3_CLIENT.delete_object(Bucket=s3_ops.BUCKET, Key=key)
+                            else:
+                                add_warning("", key, key, "Dry Run", "Simulated deletion of unreferenced S3 object")
                             s3_bytes_reclaimed += obj.get("Size", 0)
                             deleted_count += 1
                         except Exception as e:
@@ -2440,7 +2581,10 @@ def process_storage_cleanup(target="all", categories=None, grace_period_days=7, 
     s3_reclaimed_mb = round(s3_bytes_reclaimed / (1024.0 * 1024.0), 2)
     total_reclaimed_mb = round((disk_bytes_reclaimed + s3_bytes_reclaimed) / (1024.0 * 1024.0), 2)
 
-    summary_msg = frappe._("Storage cleanup completed: {0} deleted, {1} skipped, {2} failed. Reclaimed Disk: {3} MB, S3: {4} MB (Total: {5} MB).").format(
+    action_label = frappe._("Storage cleanup (Dry Run)") if dry_run else frappe._("Storage cleanup")
+    summary_msg = frappe._("{0} completed: {1} simulated, {2} skipped, {3} failed. Reclaimable Disk: {4} MB, S3: {5} MB (Total: {6} MB).").format(
+        action_label, deleted_count, skipped_count, failed_count, disk_reclaimed_mb, s3_reclaimed_mb, total_reclaimed_mb
+    ) if dry_run else frappe._("Storage cleanup completed: {0} deleted, {1} skipped, {2} failed. Reclaimed Disk: {3} MB, S3: {4} MB (Total: {5} MB).").format(
         deleted_count, skipped_count, failed_count, disk_reclaimed_mb, s3_reclaimed_mb, total_reclaimed_mb
     )
     frappe.logger().info(summary_msg)
@@ -2505,7 +2649,8 @@ def process_storage_cleanup(target="all", categories=None, grace_period_days=7, 
             "migration_doc": migration_doc_name,
             "disk_reclaimed_mb": disk_reclaimed_mb,
             "s3_reclaimed_mb": s3_reclaimed_mb,
-            "reclaimed_mb": total_reclaimed_mb
+            "reclaimed_mb": total_reclaimed_mb,
+            "dry_run": dry_run
         },
         user=user
     )

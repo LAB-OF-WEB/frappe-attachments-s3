@@ -7,4 +7,15 @@ import frappe
 from frappe.model.document import Document
 
 class S3Migration(Document):
-	pass
+	def before_insert(self):
+		if (
+			not getattr(self.flags, "ignore_permissions", False)
+			and not getattr(frappe.flags, "in_test", False)
+			and not getattr(frappe.flags, "in_install", False)
+			and not getattr(frappe.flags, "in_migrate", False)
+		):
+			frappe.throw(
+				frappe._("Manual creation of S3 Migration records is not permitted. Migrations must be initiated from S3 File Attachment settings."),
+				frappe.PermissionError,
+			)
+

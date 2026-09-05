@@ -2,7 +2,21 @@
 // For license information, please see license.txt
 
 frappe.ui.form.on('S3 File', {
+	onload: function(frm) {
+		if (frm.is_new()) {
+			frappe.msgprint({
+				title: __('Not Permitted'),
+				indicator: 'red',
+				message: __('Manual creation of S3 File records is disabled. S3 Files are tracked automatically when attachments are synchronized.')
+			});
+			frappe.set_route('List', 'S3 File');
+		}
+	},
 	refresh: function(frm) {
+		if (frm.is_new()) {
+			frm.disable_save();
+			return;
+		}
 		if (!frm.is_new() && frm.doc.status !== 'Restored') {
 			frm.add_custom_button(__('Restore to Disk'), function() {
 				frappe.confirm(

@@ -684,3 +684,97 @@ class TestS3FileAttachment(unittest.TestCase):
         self.assertNotIn("aws_access_key_id", call_kwargs)
         self.assertNotIn("aws_secret_access_key", call_kwargs)
 
+    @patch("os.path.exists", return_value=True)
+    @patch("os.path.getsize", return_value=1024)
+    @patch("frappe.get_all")
+    @patch("frappe.db.sql")
+    @patch("frappe.db.exists")
+    def test_scan_storage_space_scoped_disk(self, mock_exists_db, mock_sql, mock_get_all, mock_getsize, mock_exists_fs):
+        from frappe_s3_attachment.controller import scan_storage_space
+        frappe.utils.get_site_path.return_value = "/sites/mysite"
+        mock_exists_fs.return_value = True
+
+        mock_get_all.return_value = [
+            {"name": "S3F-001", "original_file_url": "/files/test1.pdf", "is_private": 0, "file_name": "test1.pdf"}
+        ]
+        mock_sql.side_effect = [
+            [], # tabFile with S3 url
+            [{"name": "FILE-002", "file_name": "orphan.png", "file_url": "/files/orphan.png", "file_size": 2048, "attached_to_doctype": "Item", "attached_to_name": "DELETED-ITEM", "is_private": 0}], # attached files
+            [{"name": "FILE-003", "file_name": "unlinked.pdf", "file_url": "/files/unlinked.pdf", "file_size": 4096, "is_private": 0}], # unlinked files
+            [{"file_url": "/files/test1.pdf"}], # db file urls
+            [{"original_file_url": "/files/test1.pdf"}], # s3 orig urls
+        ]
+        mock_exists_db.return_value = False
+
+        with patch("frappe_s3_attachment.controller.S3Operations") as mock_s3_ops_cls:
+            s3_inst = MagicMock()
+            s3_inst.S3_CLIENT = None
+            mock_s3_ops_cls.return_value = s3_inst
+
+            res = scan_storage_space(grace_period_days=7, scope="disk", fast_scan=True)
+            self.assertEqual(res["status"], "success")
+            self.assertEqual(res["scope"], "disk")
+            self.assertTrue(res["fast_scan"])
+            self.assertEqual(res["disk_summary"]["duplicate_local_files"]["count"], 1)
+            self.assertIn("samples", res["disk_summary"]["duplicate_local_files"])
+            self.assertGreater(len(res["disk_summary"]["duplicate_local_files"]["samples"]), 0)
+
+    @patch("frappe.enqueue")
+    def test_enqueue_scan_storage_space(self, mock_enqueue):
+        from frappe_s3_attachment.controller import enqueue_scan_storage_space
+        res = enqueue_scan_storage_space(grace_period_days=14, scope="disk", fast_scan=True)
+        self.assertEqual(res["status"], "enqueued")
+        self.assertEqual(res["scope"], "disk")
+        self.assertTrue(res["fast_scan"])
+        mock_enqueue.assert_called_once()
+
+    @patch("frappe.enqueue")
+    @patch("frappe.new_doc")
+    def test_reclaim_storage_space_dry_run(self, mock_new_doc, mock_enqueue):
+        from frappe_s3_attachment.controller import reclaim_storage_space
+        mock_mig_doc = MagicMock()
+        mock_mig_doc.name = "S3MIG-DRY-001"
+        mock_new_doc.return_value = mock_mig_doc
+
+        res = reclaim_storage_space(target="disk", categories=["duplicate_local_files"], dry_run=True)
+        self.assertEqual(res["status"], "enqueued")
+        self.assertTrue(res["dry_run"])
+        self.assertEqual(res["migration_doc"], "S3MIG-DRY-001")
+        mock_enqueue.assert_called_once()
+        self.assertTrue(mock_enqueue.call_args[1].get("dry_run"))
+
+    @patch("os.remove")
+    @patch("os.path.exists", return_value=True)
+    @patch("os.path.getsize", return_value=1024)
+    @patch("frappe.get_all")
+    @patch("frappe.db.sql")
+    @patch("frappe.new_doc")
+    def test_process_storage_cleanup_dry_run(
+        self, mock_new_doc, mock_sql, mock_get_all, mock_getsize, mock_exists, mock_remove
+    ):
+        from frappe_s3_attachment.controller import process_storage_cleanup
+        frappe.utils.get_site_path.return_value = "/sites/mysite"
+
+        mock_mig_doc = MagicMock()
+        mock_mig_doc.name = "S3MIG-002"
+        mock_new_doc.return_value = mock_mig_doc
+
+        mock_get_all.return_value = [
+            {"name": "S3F-001", "s3_key": "2026/08/test.pdf", "original_file_url": "/files/test.pdf", "is_private": 0, "file_name": "test.pdf"}
+        ]
+
+        with patch("frappe_s3_attachment.controller.S3Operations") as mock_s3_ops_cls:
+            s3_inst = MagicMock()
+            s3_inst.disable_s3_upload = 0
+            s3_inst.do_not_change_file_url = 0
+            s3_inst.verify_s3_object_exists.return_value = True
+            mock_s3_ops_cls.return_value = s3_inst
+
+            process_storage_cleanup(target="disk", categories=["duplicate_local_files"], dry_run=True)
+
+            # In dry_run mode, files MUST NOT be removed!
+            mock_remove.assert_not_called()
+            # Status update SQL still called
+            mock_sql.assert_called()
+
+

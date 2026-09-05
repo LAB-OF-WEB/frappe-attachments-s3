@@ -15,6 +15,18 @@ from frappe_s3_attachment.controller import (
 
 class S3File(Document):
 
+    def before_insert(self):
+        if (
+            not getattr(self.flags, "ignore_permissions", False)
+            and not getattr(frappe.flags, "in_test", False)
+            and not getattr(frappe.flags, "in_install", False)
+            and not getattr(frappe.flags, "in_migrate", False)
+        ):
+            frappe.throw(
+                frappe._("Manual creation of S3 File records is not permitted. S3 Files are tracked automatically by the system."),
+                frappe.PermissionError,
+            )
+
     @frappe.whitelist()
     def restore_to_disk(self, s3_operations=None, batch_mode=False):
         """

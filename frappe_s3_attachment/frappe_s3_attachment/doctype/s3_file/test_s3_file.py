@@ -57,6 +57,17 @@ if "frappe" not in sys.modules:
     m_frappe.get_roles.return_value = ["System Manager"]
     m_frappe.utils.get_site_path.return_value = "/sites/mysite"
     m_frappe.utils.now_datetime.return_value = "2026-08-22 23:00:00"
+    class MockPermissionError(Exception):
+        pass
+
+    m_frappe.PermissionError = MockPermissionError
+
+    def _throw(msg, exc=None):
+        if exc and isinstance(exc, type) and issubclass(exc, Exception):
+            raise exc(msg)
+        raise Exception(msg)
+
+    m_frappe.throw = _throw
     m_frappe.model.document.Document = MockDocument
 
     sys.modules["frappe"] = m_frappe
@@ -77,6 +88,7 @@ for mod in [
 import frappe  # noqa: E402
 from frappe_s3_attachment.controller import get_local_filepath  # noqa: E402
 from frappe_s3_attachment.frappe_s3_attachment.doctype.s3_file.s3_file import S3File  # noqa: E402
+from frappe_s3_attachment.frappe_s3_attachment.doctype.s3_migration.s3_migration import S3Migration  # noqa: E402
 
 
 class TestS3File(unittest.TestCase):
@@ -84,6 +96,10 @@ class TestS3File(unittest.TestCase):
     def setUp(self):
         frappe.reset_mock()
         frappe.flags.in_test = True
+        frappe.flags.in_install = False
+        frappe.flags.in_migrate = False
+        frappe.throw = _throw
+        frappe.PermissionError = MockPermissionError
         frappe.utils.get_site_path.return_value = "/sites/mysite"
         frappe.utils.now_datetime.return_value = "2026-08-22 23:00:00"
 
@@ -193,3 +209,32 @@ class TestS3File(unittest.TestCase):
             expected_path
         )
         mock_commit.assert_called_once()
+
+    def test_s3_file_before_insert_prevents_manual_creation(self):
+        frappe.flags.in_test = False
+        doc = S3File()
+        doc.flags = MagicMock(ignore_permissions=False)
+        with self.assertRaises(frappe.PermissionError):
+            doc.before_insert()
+
+    def test_s3_file_before_insert_allows_ignore_permissions(self):
+        frappe.flags.in_test = False
+        doc = S3File()
+        doc.flags = MagicMock(ignore_permissions=True)
+        # Should not raise exception
+        doc.before_insert()
+
+    def test_s3_migration_before_insert_prevents_manual_creation(self):
+        frappe.flags.in_test = False
+        doc = S3Migration()
+        doc.flags = MagicMock(ignore_permissions=False)
+        with self.assertRaises(frappe.PermissionError):
+            doc.before_insert()
+
+    def test_s3_migration_before_insert_allows_ignore_permissions(self):
+        frappe.flags.in_test = False
+        doc = S3Migration()
+        doc.flags = MagicMock(ignore_permissions=True)
+        # Should not raise exception
+        doc.before_insert()
+

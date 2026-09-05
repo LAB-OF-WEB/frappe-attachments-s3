@@ -2,7 +2,21 @@
 // For license information, please see license.txt
 
 frappe.ui.form.on('S3 Migration', {
+	onload: function(frm) {
+		if (frm.is_new()) {
+			frappe.msgprint({
+				title: __('Not Permitted'),
+				indicator: 'red',
+				message: __('Manual creation of S3 Migration records is disabled. Migrations must be initiated from S3 File Attachment settings.')
+			});
+			frappe.set_route('List', 'S3 Migration');
+		}
+	},
 	refresh: function(frm) {
+		if (frm.is_new()) {
+			frm.disable_save();
+			return;
+		}
 		frappe.realtime.off('s3_migration_progress');
 		frappe.realtime.on('s3_migration_progress', function(data) {
 			if (data && data.migration_doc === frm.doc.name) {
